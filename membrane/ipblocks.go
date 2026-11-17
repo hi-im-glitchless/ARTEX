@@ -1,6 +1,7 @@
 package membrane
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 
@@ -64,7 +65,7 @@ func parseBlock(b db.MembraneBlock) (ipBlock, error) {
 	r, err1 := netip.ParsePrefix(b.RealPrefix)
 	a, err2 := netip.ParsePrefix(b.AliasPrefix)
 	if err1 != nil || err2 != nil || !r.Addr().Is4() || !a.Addr().Is4() || r.Bits() != a.Bits() || r.Bits() != b.Bits {
-		return ipBlock{}, fmt.Errorf("membrane store: corrupt ip block %q -> %q", b.RealPrefix, b.AliasPrefix)
+		return ipBlock{}, fmt.Errorf("membrane store: corrupt ip block (alias %q)", b.AliasPrefix)
 	}
 	return ipBlock{real: r.Masked(), alias: a.Masked()}, nil
 }
@@ -97,7 +98,7 @@ func coveringBlock(blocks []ipBlock, a netip.Addr) (ipBlock, bool) {
 func (s *Store) allocate(real netip.Prefix) (ipBlock, error) {
 	ap, err := s.p.AllocateMembraneBlock(real.String(), real.Bits())
 	if err != nil {
-		return ipBlock{}, fmt.Errorf("membrane: allocate block for %s: %w", real, err)
+		return ipBlock{}, fmt.Errorf("membrane: allocate /%d block: %w", real.Bits(), err)
 	}
 	b, err := parseBlock(db.MembraneBlock{RealPrefix: real.String(), AliasPrefix: ap, Bits: real.Bits()})
 	if err != nil {
@@ -135,7 +136,7 @@ func (s *Store) mapIPv4(a netip.Addr) (netip.Addr, error) {
 func (s *Store) IPv4Alias(ip netip.Addr, prov Provenance) (netip.Addr, error) {
 	ip = ip.Unmap()
 	if !ip.Is4() {
-		return netip.Addr{}, fmt.Errorf("membrane: %v is not IPv4", ip)
+		return netip.Addr{}, errors.New("membrane: address is not IPv4")
 	}
 	a, err := s.Enroll(KindIPv4, ip.String(), prov)
 	if err != nil {
@@ -159,7 +160,7 @@ func (s *Store) SeedCIDR(p netip.Prefix, prov Provenance) error {
 		return nil
 	}
 	if p.Bits() < 8 {
-		return fmt.Errorf("membrane: refusing to seed %s (wider than /8)", p)
+		return fmt.Errorf("membrane: refusing to seed a /%d prefix (wider than /8)", p.Bits())
 	}
 	s.enrollMu.Lock()
 	defer s.enrollMu.Unlock()

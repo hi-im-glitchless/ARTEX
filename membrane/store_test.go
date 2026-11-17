@@ -51,6 +51,23 @@ func (f *fakePersistence) InsertMembraneEntry(e *db.MembraneEntry) (db.MembraneE
 	return n, nil
 }
 
+func (f *fakePersistence) UpdateMembraneEntryAlias(id int64, newAlias string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.entries {
+		x := &f.entries[i]
+		if x.ID != id {
+			continue
+		}
+		if x.Alias != newAlias {
+			x.RetiredAliases = append(append([]string(nil), x.RetiredAliases...), x.Alias)
+			x.Alias = newAlias
+		}
+		return nil
+	}
+	return errors.New("no such entry")
+}
+
 func (f *fakePersistence) ListMembraneEntries() ([]db.MembraneEntry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -540,5 +557,133 @@ func TestLoadKeys(t *testing.T) {
 	}
 	if _, _, _, err := LoadKeysSource(dir); err == nil {
 		t.Fatal("world-readable key file accepted")
+	}
+}
+
+func TestErrorsNeverContainOriginals(t *testing.T) {
+	s, p := newTestStore(t)
+	// Make "secretcorp" a keyword so a crafted host collides with a real one.
+	kw, err := s.Enroll(KindOrg, "secretcorp", seedProv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Enroll(KindDomain, strings.ToLower(kw)+"-vpn.secretcorp.pt", seedProv); err != nil {
+		t.Fatal(err)
+	}
+	type tc struct {
+		name, secret string
+		run          func() error
+	}
+	enroll := func(k Kind, v string) func() error {
+		return func() error { _, err := s.Enroll(k, v, seedProv); return err }
+	}
+	cases := []tc{
+		{"domain with space", "secretcorp", enroll(KindDomain, "secretcorp portal.pt")},
+		{"domain without root", "secretcorpx", enroll(KindDomain, "secretcorpx")},
+		{"email without at", "secretcorp", enroll(KindEmail, "secretcorp")},
+		{"email bad domain", "secretcorp", enroll(KindEmail, "a@secretcorp bad.pt")},
+		{"ipv4 unparsable", "secretcorp", enroll(KindIPv4, "secretcorp-not-an-ip")},
+		{"ipv6 as ipv4", "5ec7", enroll(KindIPv4, "2a00:5ec7::1")},
+		{"ipv4 as ipv6", "185.77", enroll(KindIPv6, "185.77.1.2")},
+		{"subdomain collision", "secretcorp", enroll(KindDomain, "secretcorp-vpn.secretcorp.pt")},
+		{"IPv4Alias of ipv6", "5ec7", func() error {
+			_, err := s.IPv4Alias(netip.MustParseAddr("2a00:5ec7::1"), seedProv)
+			return err
+		}},
+		{"SeedCIDR too wide", "4.0.0.0", func() error {
+			return s.SeedCIDR(netip.MustParsePrefix("4.0.0.0/7"), seedProv)
+		}},
+		{"reload bad stored original", "secretcorp", func() error {
+			mac := s.indexHMAC(KindDomain, "x")
+			enc, _ := s.encrypt(KindDomain, mac, "secretcorp bad.pt")
+			bad := &fakePersistence{entries: []db.MembraneEntry{{ID: 1, Kind: "domain", OriginalHMAC: mac, OriginalEnc: enc, Alias: "zz.example"}}}
+			_, err := OpenStore(bad, testEncKey, testHMACKey)
+			return err
+		}},
+		{"corrupt block", "185.99", func() error {
+			bad := &fakePersistence{blocks: []db.MembraneBlock{{RealPrefix: "185.99.1.0/24", AliasPrefix: "240.0.0.0/23", Bits: 24}}}
+			_, err := OpenStore(bad, testEncKey, testHMACKey)
+			return err
+		}},
+	}
+	_ = p
+	for _, c := range cases {
+		err := c.run()
+		if err == nil {
+			t.Errorf("%s: expected an error", c.name)
+			continue
+		}
+		if strings.Contains(strings.ToLower(err.Error()), c.secret) {
+			t.Errorf("%s: error leaks original: %v", c.name, err)
+		}
+	}
+}
+
+func TestKeywordAfterSubdomainRemints(t *testing.T) {
+	s, p := newTestStore(t)
+	old, err := s.Enroll(KindDomain, "acmebank-vpn.acmebank.pt", seedProv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldMail, err := s.Enroll(KindEmail, "ops@acmebank-vpn.acmebank.pt", seedProv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(old, "acmebank") {
+		t.Fatalf("precondition: %q should still carry the label", old)
+	}
+	kw, err := s.Enroll(KindOrg, "AcmeBank", seedProv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, _, _ := s.AliasFor("acmebank.pt")
+	check := func(s *Store) {
+		t.Helper()
+		cur, _, ok := s.AliasFor("acmebank-vpn.acmebank.pt")
+		if !ok || cur != strings.ToLower(kw)+"-vpn."+root {
+			t.Fatalf("re-minted alias %q (kw %q root %q)", cur, kw, root)
+		}
+		mail, _, _ := s.AliasFor("ops@acmebank-vpn.acmebank.pt")
+		if strings.Contains(mail, "acmebank") || !strings.HasSuffix(mail, "@"+cur) {
+			t.Fatalf("email not re-minted: %q", mail)
+		}
+		for _, a := range []string{old, strings.ToUpper(old), cur} {
+			if o, k, ok := s.OriginalFor(a); !ok || o != "acmebank-vpn.acmebank.pt" || k != KindDomain {
+				t.Fatalf("OriginalFor(%q) = %q %q %v", a, o, k, ok)
+			}
+		}
+		if o, _, ok := s.OriginalFor(oldMail); !ok || o != "ops@acmebank-vpn.acmebank.pt" {
+			t.Fatalf("OriginalFor(old mail) = %q %v", o, ok)
+		}
+		ms := s.Dictionary().FindAll("see acmebank-vpn.acmebank.pt")
+		if len(ms) != 1 || strings.Contains(ms[0].Alias, "acmebank") {
+			t.Fatalf("dictionary still maps to a leaking alias: %+v", ms)
+		}
+	}
+	check(s)
+	s2, err := OpenStore(p, testEncKey, testHMACKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(s2)
+	// A retired alias is never handed out again to a different original.
+	if s2.aliasTaken(old) == false {
+		t.Fatal("retired alias not reserved")
+	}
+}
+
+func TestDomainEnrolledAfterKeywordUsesIt(t *testing.T) {
+	s, _ := newTestStore(t)
+	kw, err := s.Enroll(KindProduct, "AcmeOnline", seedProv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.Enroll(KindDomain, "login.ACMEONLINE-app.acme.pt", seedProv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, _, _ := s.AliasFor("acme.pt")
+	if a != "login."+strings.ToLower(kw)+"-app."+root {
+		t.Fatalf("alias %q", a)
 	}
 }

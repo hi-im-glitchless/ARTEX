@@ -24,11 +24,14 @@ type MembraneEntry struct {
 	OriginalHMAC string
 	OriginalEnc  []byte
 	Alias        string
-	Source       string
-	CompanyIDs   []int64
-	TaskIDs      []int64
-	FirstSeen    time.Time
-	LastSeen     time.Time
+	// RetiredAliases are earlier aliases of this original, kept for reverse
+	// lookup after a re-mint (oldest first).
+	RetiredAliases []string
+	Source         string
+	CompanyIDs     []int64
+	TaskIDs        []int64
+	FirstSeen      time.Time
+	LastSeen       time.Time
 }
 
 // MembraneBlock maps a real CIDR prefix to its alias block in 240.0.0.0/4.
@@ -74,16 +77,20 @@ func decodeInt64s(raw []byte) []int64 {
 }
 
 const membraneEntryCols = `id, kind, original_hmac, original_enc, alias, source,
-	to_jsonb(company_ids), to_jsonb(task_ids), first_seen, last_seen`
+	to_jsonb(company_ids), to_jsonb(task_ids), first_seen, last_seen, to_jsonb(retired_aliases)`
 
 func scanMembraneEntry(sc interface{ Scan(...any) error }) (MembraneEntry, error) {
 	var e MembraneEntry
-	var cj, tj []byte
+	var cj, tj, rj []byte
 	if err := sc.Scan(&e.ID, &e.Kind, &e.OriginalHMAC, &e.OriginalEnc, &e.Alias, &e.Source,
-		&cj, &tj, &e.FirstSeen, &e.LastSeen); err != nil {
+		&cj, &tj, &e.FirstSeen, &e.LastSeen, &rj); err != nil {
 		return MembraneEntry{}, err
 	}
 	e.CompanyIDs, e.TaskIDs = decodeInt64s(cj), decodeInt64s(tj)
+	e.RetiredAliases = []string{}
+	if err := json.Unmarshal(rj, &e.RetiredAliases); err != nil {
+		return MembraneEntry{}, fmt.Errorf("membrane entry %d: retired aliases: %w", e.ID, err)
+	}
 	return e, nil
 }
 
@@ -112,6 +119,26 @@ RETURNING `+membraneEntryCols,
 		return MembraneEntry{}, fmt.Errorf("insert membrane entry: %w", err)
 	}
 	return out, nil
+}
+
+// UpdateMembraneEntryAlias replaces the alias of entry id with newAlias and,
+// in the same statement, appends the previous alias to retired_aliases. It is
+// a no-op when the alias is already newAlias.
+func (d *DB) UpdateMembraneEntryAlias(id int64, newAlias string) error {
+	res, err := d.Exec(`
+UPDATE membrane_entries SET
+    retired_aliases = CASE WHEN alias = $2 THEN retired_aliases
+                           ELSE array_append(retired_aliases, alias) END,
+    alias = $2,
+    last_seen = now()
+WHERE id = $1`, id, newAlias)
+	if err != nil {
+		return fmt.Errorf("update membrane entry %d alias: %w", id, err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return fmt.Errorf("update membrane entry %d alias: %w", id, sql.ErrNoRows)
+	}
+	return nil
 }
 
 // ListMembraneEntries returns every mapping row ordered by id.

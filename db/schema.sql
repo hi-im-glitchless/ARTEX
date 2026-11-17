@@ -1502,6 +1502,9 @@ CREATE TABLE IF NOT EXISTS membrane_entries (
     CONSTRAINT uq_membrane_entries_orig UNIQUE (kind, original_hmac),
     CONSTRAINT uq_membrane_entries_alias UNIQUE (alias)
 );
+-- Aliases replaced by a re-mint (e.g. a keyword enrolled after a subdomain)
+-- stay valid for reverse lookup only.
+ALTER TABLE membrane_entries ADD COLUMN IF NOT EXISTS retired_aliases TEXT[] NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS idx_membrane_entries_companies ON membrane_entries USING GIN(company_ids);
 
 -- Per-real-prefix allocation of alias blocks inside 240.0.0.0/4.

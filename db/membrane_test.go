@@ -59,6 +59,47 @@ func TestMembraneEntryUpsertMergesProvenance(t *testing.T) {
 	}
 }
 
+func TestMembraneEntryUpdateAliasRetiresOld(t *testing.T) {
+	d := membraneTestDB(t)
+	hmac := fmt.Sprintf("hmac-remint-%d", time.Now().UnixNano())
+	t.Cleanup(func() { d.Exec(`DELETE FROM membrane_entries WHERE original_hmac=$1`, hmac) })
+	e, err := d.InsertMembraneEntry(&MembraneEntry{
+		Kind: "domain", OriginalHMAC: hmac, OriginalEnc: []byte{1}, Alias: "a1-" + hmac,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(e.RetiredAliases) != 0 {
+		t.Fatalf("new entry has retired aliases %v", e.RetiredAliases)
+	}
+	if err := d.UpdateMembraneEntryAlias(e.ID, "a2-"+hmac); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpdateMembraneEntryAlias(e.ID, "a2-"+hmac); err != nil { // no-op
+		t.Fatal(err)
+	}
+	if err := d.UpdateMembraneEntryAlias(e.ID, "a3-"+hmac); err != nil {
+		t.Fatal(err)
+	}
+	list, err := d.ListMembraneEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *MembraneEntry
+	for i := range list {
+		if list[i].ID == e.ID {
+			got = &list[i]
+		}
+	}
+	if got == nil || got.Alias != "a3-"+hmac ||
+		!reflect.DeepEqual(got.RetiredAliases, []string{"a1-" + hmac, "a2-" + hmac}) {
+		t.Fatalf("after re-mint: %+v", got)
+	}
+	if err := d.UpdateMembraneEntryAlias(-1, "x-"+hmac); err == nil {
+		t.Fatal("update of a missing entry must fail")
+	}
+}
+
 func resetMembraneBlocks(d *DB, prefixes ...string) {
 	for _, p := range prefixes {
 		d.Exec(`DELETE FROM membrane_ip_blocks WHERE real_prefix=$1`, p)

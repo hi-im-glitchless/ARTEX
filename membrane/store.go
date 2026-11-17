@@ -25,6 +25,7 @@ import (
 type Persistence interface {
 	InsertMembraneEntry(e *db.MembraneEntry) (db.MembraneEntry, error)
 	ListMembraneEntries() ([]db.MembraneEntry, error)
+	UpdateMembraneEntryAlias(id int64, newAlias string) error
 	AllocateMembraneBlock(realPrefix string, bits int) (aliasPrefix string, err error)
 	ListMembraneBlocks() ([]db.MembraneBlock, error)
 }
@@ -72,10 +73,12 @@ var freeMailDomains = map[string]bool{
 
 // entry is one decrypted mapping held in memory.
 type entry struct {
+	id         int64
 	kind       Kind
 	norm       string // normalised form (index HMAC input)
 	original   string // stored original (as first enrolled, trimmed)
 	alias      string
+	retired    []string // earlier aliases, valid for reverse lookup only
 	companyIDs []int64
 	taskIDs    []int64
 }
@@ -190,13 +193,13 @@ func (s *Store) reload() error {
 		}
 		norm, _, err := normalise(Kind(r.Kind), orig)
 		if err != nil {
-			return fmt.Errorf("membrane store: entry %d: %w", r.ID, err)
+			return fmt.Errorf("membrane store: entry %d: stored %s original does not normalise", r.ID, r.Kind)
 		}
 		if !hmac.Equal([]byte(s.indexHMAC(Kind(r.Kind), norm)), []byte(r.OriginalHMAC)) {
 			return fmt.Errorf("membrane store: entry %d: index HMAC mismatch (wrong ARTEX_MEMBRANE_HMAC_KEY?)", r.ID)
 		}
-		fresh.indexEntry(&entry{kind: Kind(r.Kind), norm: norm, original: orig, alias: r.Alias,
-			companyIDs: r.CompanyIDs, taskIDs: r.TaskIDs})
+		fresh.indexEntry(&entry{id: r.ID, kind: Kind(r.Kind), norm: norm, original: orig, alias: r.Alias,
+			retired: r.RetiredAliases, companyIDs: r.CompanyIDs, taskIDs: r.TaskIDs})
 	}
 	for _, b := range brows {
 		blk, err := parseBlock(b)
@@ -230,15 +233,25 @@ func (s *Store) indexEntry(e *entry) {
 		if _, ok := s.origFold[e.norm]; !ok {
 			s.origFold[e.norm] = e
 		}
-		s.aliasFold[strings.ToLower(e.alias)] = e
 	} else if _, ok := s.origSens[e.norm]; !ok {
 		s.origSens[e.norm] = e
 	}
-	s.aliasExact[e.alias] = e
+	for _, a := range e.retired {
+		s.indexAlias(e, a)
+	}
+	s.indexAlias(e, e.alias)
 	if e.kind == KindDomain && isRootDomain(e.norm) {
 		s.roots[e.norm] = e.alias
 	}
 	s.dictDirty = true
+}
+
+// indexAlias makes a (current or retired) resolve to e. Caller holds mu.
+func (s *Store) indexAlias(e *entry, a string) {
+	s.aliasExact[a] = e
+	if foldKind(e.kind) {
+		s.aliasFold[strings.ToLower(a)] = e
+	}
 }
 
 // foldKind reports whether originals of kind match case-insensitively.
@@ -261,11 +274,11 @@ func isRootDomain(d string) bool {
 func normDomain(s string) (string, error) {
 	s = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(s)), ".")
 	if s == "" || strings.ContainsAny(s, " \t\r\n/@:") {
-		return "", fmt.Errorf("invalid domain %q", s)
+		return "", errors.New("invalid domain")
 	}
 	a, err := idna.Punycode.ToASCII(s)
 	if err != nil {
-		return "", fmt.Errorf("invalid domain %q: %w", s, err)
+		return "", errors.New("invalid domain (not IDNA-encodable)")
 	}
 	return strings.ToLower(a), nil
 }
@@ -297,7 +310,7 @@ func normalise(kind Kind, s string) (norm, stored string, err error) {
 	case KindIPv4, KindIPv6:
 		a, err := netip.ParseAddr(strings.TrimSpace(s))
 		if err != nil {
-			return "", "", err
+			return "", "", fmt.Errorf("invalid %s address", kind) // library error embeds the input
 		}
 		c := a.Unmap().String()
 		return c, c, nil
@@ -343,7 +356,7 @@ func (s *Store) enrollLocked(kind Kind, original string, prov Provenance) (strin
 	case KindIPv4, KindIPv6:
 		a, _ := netip.ParseAddr(norm)
 		if a.Is4() != (kind == KindIPv4) {
-			return "", fmt.Errorf("membrane enroll: %q is not %s", norm, kind)
+			return "", fmt.Errorf("membrane enroll: address is not %s", kind)
 		}
 		if !isPublicIP(a) {
 			return norm, nil
@@ -372,10 +385,7 @@ func (s *Store) enrollLocked(kind Kind, original string, prov Provenance) (strin
 		if err != nil {
 			return "", fmt.Errorf("membrane enroll %s: %w", kind, err)
 		}
-		s.mu.RLock()
-		taken := s.aliasExact[alias] != nil || s.aliasFold[strings.ToLower(alias)] != nil
-		s.mu.RUnlock()
-		if taken {
+		if s.aliasTaken(alias) {
 			continue
 		}
 		enc, err := s.encrypt(kind, mac, stored)
@@ -406,14 +416,26 @@ func (s *Store) enrollLocked(kind Kind, original string, prov Provenance) (strin
 			continue
 		}
 		// On conflict the row (and alias) of an earlier enrolment wins.
-		ne := &entry{kind: kind, norm: norm, original: stored, alias: row.Alias,
-			companyIDs: row.CompanyIDs, taskIDs: row.TaskIDs}
+		ne := &entry{id: row.ID, kind: kind, norm: norm, original: stored, alias: row.Alias,
+			retired: row.RetiredAliases, companyIDs: row.CompanyIDs, taskIDs: row.TaskIDs}
 		s.mu.Lock()
 		s.indexEntry(ne)
 		s.mu.Unlock()
+		if isKeywordKind(kind) {
+			if err := s.remintForKeyword(norm); err != nil {
+				return "", err
+			}
+		}
 		return row.Alias, nil
 	}
 	return "", fmt.Errorf("membrane enroll %s: no free alias after %d attempts", kind, maxMintAttempt)
+}
+
+// aliasTaken reports whether alias (current or retired, any case) is in use.
+func (s *Store) aliasTaken(alias string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.aliasExact[alias] != nil || s.aliasFold[strings.ToLower(alias)] != nil
 }
 
 func sourceOf(p Provenance) string {
@@ -472,7 +494,7 @@ func (s *Store) mint(kind Kind, norm, stored string, attempt int, prov Provenanc
 		return "[PRIVATE_KEY_" + k[strings.LastIndexByte(k, '-')+1:] + "]", nil
 	case KindIPv4:
 		if attempt > 0 {
-			return "", fmt.Errorf("ipv4 alias of %s already taken", norm)
+			return "", errors.New("ipv4 alias already taken")
 		}
 		a, err := s.mapIPv4(netip.MustParseAddr(norm))
 		return a.String(), err
@@ -482,10 +504,109 @@ func (s *Store) mint(kind Kind, norm, stored string, attempt int, prov Provenanc
 	return s.deriverFor(attempt).FormatPreserving(kind, stored), nil
 }
 
+// subdomainAlias renders the alias of a non-root host from its real labels,
+// the current keyword dictionary and the root alias.
+func (s *Store) subdomainAlias(norm, root, rootAlias string) string {
+	labels := strings.Split(strings.TrimSuffix(norm, "."+root), ".")
+	dict := s.Dictionary()
+	for i, l := range labels {
+		labels[i] = replaceKeywords(dict, l)
+	}
+	return strings.Join(labels, ".") + "." + rootAlias
+}
+
+// remintForKeyword gives a new alias to every domain (and email on such a
+// domain) whose alias still carries keyword (lowercased) in clear, because
+// it was enrolled before the keyword (ruling R9). The old alias is retired:
+// it keeps resolving in OriginalFor but is never emitted again. Caller holds
+// enrollMu.
+func (s *Store) remintForKeyword(keyword string) error {
+	if len(keyword) < minLiteralLen || literalStoplist[keyword] {
+		return nil // not in the automaton, so it cannot be substituted
+	}
+	s.mu.RLock()
+	var hosts, mails []*entry
+	for _, e := range s.byKey {
+		switch e.kind {
+		case KindDomain:
+			if !s.isRootLocked(e.norm) && strings.Contains(strings.ToLower(e.alias), keyword) {
+				hosts = append(hosts, e)
+			}
+		case KindEmail:
+			if strings.Contains(strings.ToLower(e.alias), keyword) {
+				mails = append(mails, e)
+			}
+		}
+	}
+	s.mu.RUnlock()
+	sort.Slice(hosts, func(i, j int) bool { return hosts[i].id < hosts[j].id })
+	sort.Slice(mails, func(i, j int) bool { return mails[i].id < mails[j].id })
+
+	for _, e := range hosts {
+		root, err := publicsuffix.EffectiveTLDPlusOne(e.norm)
+		if err != nil {
+			continue
+		}
+		s.mu.RLock()
+		rootAlias, ok := s.roots[root]
+		s.mu.RUnlock()
+		if !ok {
+			continue
+		}
+		if err := s.retireAlias(e, s.subdomainAlias(e.norm, root, rootAlias)); err != nil {
+			return err
+		}
+	}
+	for _, e := range mails {
+		i := strings.LastIndexByte(e.alias, '@')
+		j := strings.LastIndexByte(e.norm, '@')
+		if i < 0 || j < 0 {
+			continue
+		}
+		da, _, ok := s.AliasFor(e.norm[j+1:])
+		if !ok {
+			continue
+		}
+		if err := s.retireAlias(e, e.alias[:i+1]+da); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) isRootLocked(norm string) bool {
+	_, ok := s.roots[norm]
+	return ok
+}
+
+// retireAlias moves e to newAlias, persisting it and keeping the old alias
+// for reverse lookup. Caller holds enrollMu.
+func (s *Store) retireAlias(e *entry, newAlias string) error {
+	if newAlias == e.alias {
+		return nil
+	}
+	if s.aliasTaken(newAlias) {
+		return fmt.Errorf("membrane re-mint %s entry %d: alias collision", e.kind, e.id)
+	}
+	if err := s.p.UpdateMembraneEntryAlias(e.id, newAlias); err != nil {
+		return fmt.Errorf("membrane re-mint %s entry %d: %w", e.kind, e.id, err)
+	}
+	s.mu.Lock()
+	e.retired = append(append([]string(nil), e.retired...), e.alias)
+	e.alias = newAlias
+	s.indexAlias(e, newAlias)
+	if e.kind == KindDomain && s.isRootLocked(e.norm) {
+		s.roots[e.norm] = newAlias
+	}
+	s.dictDirty = true
+	s.mu.Unlock()
+	return nil
+}
+
 func (s *Store) mintDomain(norm string, attempt int, prov Provenance) (string, error) {
 	root, err := publicsuffix.EffectiveTLDPlusOne(norm)
 	if err != nil {
-		return "", err
+		return "", errors.New("domain has no registrable root") // library error embeds the input
 	}
 	if root == norm {
 		if attempt == 0 {
@@ -494,18 +615,13 @@ func (s *Store) mintDomain(norm string, attempt int, prov Provenance) (string, e
 		return s.deriver.RootDomain(norm + "\x00" + strconv.Itoa(attempt)), nil
 	}
 	if attempt > 0 {
-		return "", fmt.Errorf("subdomain alias collision for a host under %s", root)
+		return "", errors.New("subdomain alias collision")
 	}
 	rootAlias, err := s.enrollLocked(KindDomain, root, prov)
 	if err != nil {
 		return "", err
 	}
-	labels := strings.Split(strings.TrimSuffix(norm, "."+root), ".")
-	dict := s.Dictionary()
-	for i, l := range labels {
-		labels[i] = replaceKeywords(dict, l)
-	}
-	return strings.Join(labels, ".") + "." + rootAlias, nil
+	return s.subdomainAlias(norm, root, rootAlias), nil
 }
 
 // replaceKeywords swaps enrolled org/product/person keywords inside a DNS
