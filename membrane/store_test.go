@@ -24,11 +24,17 @@ type fakePersistence struct {
 	inserts int
 	// failUpdates makes the next N UpdateMembraneEntryAlias calls fail.
 	failUpdates int
+	// failInserts makes the next N InsertMembraneEntry calls fail.
+	failInserts int
 }
 
 func (f *fakePersistence) InsertMembraneEntry(e *db.MembraneEntry) (db.MembraneEntry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failInserts > 0 {
+		f.failInserts--
+		return db.MembraneEntry{}, errors.New("injected insert failure")
+	}
 	f.inserts++
 	for i := range f.entries {
 		x := &f.entries[i]

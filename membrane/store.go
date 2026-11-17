@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
@@ -113,8 +114,19 @@ type Store struct {
 	blocks     []ipBlock
 	dict       *Automaton
 	dictDirty  bool
+	rdict      *Automaton // reverse (alias -> original) automaton
+	rdictGen   uint64     // aliasGen rdict was built at
 	modelKnown map[string]bool
+
+	// gen counts every change that can alter a transform's output
+	// (enrolment, re-mint, block allocation, model-known marks, reload).
+	gen atomic.Uint64
+	// aliasGen counts changes to the alias set only (rdict rebuilds).
+	aliasGen atomic.Uint64
 }
+
+// generation returns the store's change counter.
+func (s *Store) generation() uint64 { return s.gen.Load() }
 
 // OpenStore loads and decrypts every entry. encKey must be 32 bytes
 // (AES-256) and hmacKey 32 bytes. A row that does not decrypt, or whose
@@ -246,6 +258,8 @@ func (s *Store) reload() error {
 	s.aliasExact, s.aliasFold, s.roots = fresh.aliasExact, fresh.aliasFold, fresh.roots
 	s.blocks = fresh.blocks
 	s.dict, s.dictDirty = nil, true
+	s.gen.Add(1)
+	s.aliasGen.Add(1)
 	s.mu.Unlock()
 	return nil
 }
@@ -277,6 +291,8 @@ func (s *Store) indexEntry(e *entry) {
 		s.roots[e.norm] = e.alias
 	}
 	s.dictDirty = true
+	s.gen.Add(1)
+	s.aliasGen.Add(1)
 }
 
 // indexAlias makes a (current or retired) resolve to e. Caller holds mu.
@@ -377,10 +393,21 @@ func (s *Store) deriverFor(attempt int) *Deriver {
 func (s *Store) Enroll(kind Kind, original string, prov Provenance) (string, error) {
 	s.enrollMu.Lock()
 	defer s.enrollMu.Unlock()
-	return s.enrollLocked(kind, original, prov)
+	return s.enrollLocked(kind, original, prov, false)
 }
 
-func (s *Store) enrollLocked(kind Kind, original string, prov Provenance) (string, error) {
+// enrollLookalike enrols a real value that is shaped like an alias (a
+// 240/4 or 2001:db8::/32 address, a host under .example) and that the store
+// did not mint (ruling R11). Unlike Enroll it does not return such values
+// unchanged. A value that is itself a minted alias is refused (fail closed):
+// enrolling it would put an alias into the dictionary of originals.
+func (s *Store) enrollLookalike(kind Kind, original string, prov Provenance) (string, error) {
+	s.enrollMu.Lock()
+	defer s.enrollMu.Unlock()
+	return s.enrollLocked(kind, original, prov, true)
+}
+
+func (s *Store) enrollLocked(kind Kind, original string, prov Provenance, look bool) (string, error) {
 	norm, stored, err := normalise(kind, original)
 	if err != nil {
 		return "", fmt.Errorf("membrane enroll: %w", err)
@@ -391,13 +418,16 @@ func (s *Store) enrollLocked(kind Kind, original string, prov Provenance) (strin
 		if a.Is4() != (kind == KindIPv4) {
 			return "", fmt.Errorf("membrane enroll: address is not %s", kind)
 		}
-		if !isPublicIP(a) {
+		if !isPublicIP(a) && !(look && inAliasSpace(a)) {
 			return norm, nil
 		}
 	case KindDomain:
-		if norm == "example" || strings.HasSuffix(norm, ".example") {
+		if !look && (norm == "example" || strings.HasSuffix(norm, ".example")) {
 			return norm, nil // already alias space (RFC 2606)
 		}
+	}
+	if look && s.aliasTaken(norm) {
+		return "", fmt.Errorf("membrane enroll %s: refusing to enrol a minted alias as an original", kind)
 	}
 
 	key := string(kind) + "\x00" + norm
@@ -408,7 +438,7 @@ func (s *Store) enrollLocked(kind Kind, original string, prov Provenance) (strin
 		if err := s.mergeProvenance(e, prov); err != nil {
 			return "", err
 		}
-		if isKeywordKind(kind) {
+		if remintKind(kind) {
 			// Idempotent: heals a re-mint that failed on an earlier call.
 			if err := s.remintForKeyword(norm); err != nil {
 				return "", err
@@ -420,12 +450,12 @@ func (s *Store) enrollLocked(kind Kind, original string, prov Provenance) (strin
 	mac := s.indexHMAC(kind, norm)
 	reloaded := false
 	for attempt := 0; attempt < maxMintAttempt; attempt++ {
-		alias, err := s.mint(kind, norm, stored, attempt, prov)
+		alias, err := s.mint(kind, norm, stored, attempt, prov, look)
 		if err != nil {
 			return "", fmt.Errorf("membrane enroll %s: %w", kind, err)
 		}
-		if s.aliasTaken(alias) {
-			continue
+		if s.aliasTaken(alias) || (kind != KindIPv4 && kind != KindIPv6 && s.isOriginal(alias)) {
+			continue // an alias equal to an original would trip the leak check
 		}
 		enc, err := s.encrypt(kind, mac, stored)
 		if err != nil {
@@ -460,7 +490,7 @@ func (s *Store) enrollLocked(kind Kind, original string, prov Provenance) (strin
 		s.mu.Lock()
 		s.indexEntry(ne)
 		s.mu.Unlock()
-		if isKeywordKind(kind) {
+		if remintKind(kind) {
 			if err := s.remintForKeyword(norm); err != nil {
 				return "", err
 			}
@@ -475,6 +505,13 @@ func (s *Store) aliasTaken(alias string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.aliasExact[alias] != nil || s.aliasFold[strings.ToLower(alias)] != nil
+}
+
+// isOriginal reports whether v (any case) is an enrolled original.
+func (s *Store) isOriginal(v string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.origSens[v] != nil || s.origFold[strings.ToLower(v)] != nil
 }
 
 func sourceOf(p Provenance) string {
@@ -520,12 +557,12 @@ func containsAll(have, want []int64) bool {
 }
 
 // mint derives the candidate alias for attempt. Caller holds enrollMu.
-func (s *Store) mint(kind Kind, norm, stored string, attempt int, prov Provenance) (string, error) {
+func (s *Store) mint(kind Kind, norm, stored string, attempt int, prov Provenance, look bool) (string, error) {
 	switch kind {
 	case KindDomain:
-		return s.mintDomain(norm, attempt, prov)
+		return s.mintDomain(norm, attempt, prov, look)
 	case KindEmail:
-		return s.mintEmail(norm, attempt, prov)
+		return s.mintEmail(norm, attempt, prov, look)
 	case KindOrg, KindProduct, KindPerson:
 		return s.keywordAlias(kind, norm, attempt), nil
 	case KindPrivateKey:
@@ -540,26 +577,53 @@ func (s *Store) mint(kind Kind, norm, stored string, attempt int, prov Provenanc
 	case KindIPv6:
 		return s.deriverFor(attempt).IPv6(netip.MustParseAddr(norm)).String(), nil
 	}
-	return s.deriverFor(attempt).FormatPreserving(kind, stored), nil
+	return formatPreservingAlias(s.deriverFor(attempt), kind, stored), nil
+}
+
+// formatPreservingAlias is FormatPreserving, except that a value with no
+// letter or digit to substitute ("!!!") would come back unchanged; it then
+// gets same-length lowercase letters instead, so no alias equals its
+// original.
+func formatPreservingAlias(d *Deriver, kind Kind, original string) string {
+	if a := d.FormatPreserving(kind, original); a != original {
+		return a
+	}
+	mac := d.mac("format-preserving-fallback", string(kind), original)
+	n := utf8.RuneCountInString(original)
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = 'a' + mac[i%len(mac)]%26
+	}
+	return string(out)
 }
 
 // subdomainAlias renders the alias of a non-root host from its real labels,
-// the current keyword dictionary and the root alias.
+// the current dictionary and the root alias.
 func (s *Store) subdomainAlias(norm, root, rootAlias string) string {
-	labels := strings.Split(strings.TrimSuffix(norm, "."+root), ".")
-	dict := s.Dictionary()
-	for i, l := range labels {
-		labels[i] = replaceKeywords(dict, l)
+	return replaceLiterals(s.Dictionary(), strings.TrimSuffix(norm, "."+root)) + "." + rootAlias
+}
+
+// remintKind reports whether enrolling an original of kind k may require
+// re-minting host aliases whose preserved labels contain it: every literal
+// replaceLiterals substitutes inside labels. Domains and emails are left out
+// (a host written inside another host's labels is rare, and a scan per new
+// host would make enrolment quadratic).
+func remintKind(k Kind) bool {
+	switch k {
+	case KindIPv4, KindIPv6, KindDomain, KindEmail:
+		return false
 	}
-	return strings.Join(labels, ".") + "." + rootAlias
+	return true
 }
 
 // remintForKeyword gives a new alias to every domain (and email on such a
-// domain) whose alias still carries keyword (lowercased) in clear, because
-// it was enrolled before the keyword (ruling R9). The old alias is retired:
-// it keeps resolving in OriginalFor but is never emitted again. Caller holds
-// enrollMu.
+// domain) whose alias still carries keyword in clear (any case), because it
+// was enrolled before it (ruling R9). keyword is an org/product/person
+// keyword or, since Task 5, any literal replaceLiterals substitutes. The old
+// alias is retired: it keeps resolving in OriginalFor but is never emitted
+// again. Caller holds enrollMu.
 func (s *Store) remintForKeyword(keyword string) error {
+	keyword = strings.ToLower(keyword)
 	if len(keyword) < minLiteralLen || literalStoplist[keyword] {
 		return nil // not in the automaton, so it cannot be substituted
 	}
@@ -638,11 +702,13 @@ func (s *Store) retireAlias(e *entry, newAlias string) error {
 		s.roots[e.norm] = newAlias
 	}
 	s.dictDirty = true
+	s.gen.Add(1)
+	s.aliasGen.Add(1)
 	s.mu.Unlock()
 	return nil
 }
 
-func (s *Store) mintDomain(norm string, attempt int, prov Provenance) (string, error) {
+func (s *Store) mintDomain(norm string, attempt int, prov Provenance, look bool) (string, error) {
 	root, err := publicsuffix.EffectiveTLDPlusOne(norm)
 	if err != nil {
 		return "", errors.New("domain has no registrable root") // library error embeds the input
@@ -656,33 +722,42 @@ func (s *Store) mintDomain(norm string, attempt int, prov Provenance) (string, e
 	if attempt > 0 {
 		return "", errors.New("subdomain alias collision")
 	}
-	rootAlias, err := s.enrollLocked(KindDomain, root, prov)
+	rootAlias, err := s.enrollLocked(KindDomain, root, prov, look)
 	if err != nil {
 		return "", err
 	}
 	return s.subdomainAlias(norm, root, rootAlias), nil
 }
 
-// replaceKeywords swaps enrolled org/product/person keywords inside a DNS
-// label for their lowercase alias. Keywords of 3-4 runes are replaced only
-// as whole tokens (ruling R10): "billing" keeps its "ing".
-func replaceKeywords(dict *Automaton, label string) string {
-	ms := dict.findAll(label, isKeywordKind)
+// replaceLiterals swaps every enrolled original written inside the
+// preserved labels of a host (prefix: the labels before the root) for its
+// alias, so no label carries an original in clear: org/product/person
+// keywords become their lowercase DNS form (acmebank-vpn -> org-7f2c-vpn),
+// domains their alias (corpx.io.internal -> 57ddff.example.internal), and
+// usernames, secrets and the like their format-preserving alias
+// (jsilva-pc -> tjwzxx-pc). Keywords of 3-4 runes are replaced only as
+// whole tokens (ruling R10): "billing" keeps its "ing".
+func replaceLiterals(dict *Automaton, prefix string) string {
+	ms := dict.FindAll(prefix)
 	if len(ms) == 0 {
-		return label
+		return prefix
 	}
 	var b strings.Builder
 	last := 0
 	for _, m := range ms {
-		b.WriteString(label[last:m.Start])
-		b.WriteString(strings.ToLower(m.Alias))
+		b.WriteString(prefix[last:m.Start])
+		if isKeywordKind(m.Kind) {
+			b.WriteString(strings.ToLower(m.Alias))
+		} else {
+			b.WriteString(m.Alias)
+		}
 		last = m.End
 	}
-	b.WriteString(label[last:])
+	b.WriteString(prefix[last:])
 	return b.String()
 }
 
-func (s *Store) mintEmail(norm string, attempt int, prov Provenance) (string, error) {
+func (s *Store) mintEmail(norm string, attempt int, prov Provenance, look bool) (string, error) {
 	i := strings.LastIndexByte(norm, '@')
 	local, dom := norm[:i], norm[i+1:]
 	if attempt > 0 {
@@ -692,7 +767,7 @@ func (s *Store) mintEmail(norm string, attempt int, prov Provenance) (string, er
 	if freeMailDomains[dom] {
 		return "u-" + strings.TrimPrefix(la, "user-") + "@" + dom, nil
 	}
-	da, err := s.enrollLocked(KindDomain, dom, prov)
+	da, err := s.enrollLocked(KindDomain, dom, prov, look)
 	if err != nil {
 		return "", err
 	}
@@ -760,7 +835,10 @@ func (s *Store) MarkModelKnown(domain string) {
 		return
 	}
 	s.mu.Lock()
-	s.modelKnown[d] = true
+	if !s.modelKnown[d] {
+		s.modelKnown[d] = true
+		s.gen.Add(1)
+	}
 	s.mu.Unlock()
 }
 
@@ -845,4 +923,79 @@ func (s *Store) patternsLocked() []acPattern {
 		}
 	}
 	return pats
+}
+
+// ReverseDictionary returns an immutable automaton over every alias
+// (current and retired) that maps back to its original, for ToReal. Like
+// Dictionary it leaves out IP aliases (resolved by address, not literal) and
+// aliases shorter than 3 bytes. Domain and email aliases match at host
+// boundaries, keyword aliases as whole tokens, everything else anywhere
+// (mirroring how the forward dictionary placed them).
+func (s *Store) ReverseDictionary() *Automaton {
+	g := s.aliasGen.Load()
+	s.mu.RLock()
+	if s.rdict != nil && s.rdictGen == g {
+		d := s.rdict
+		s.mu.RUnlock()
+		return d
+	}
+	s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g = s.aliasGen.Load()
+	if s.rdict == nil || s.rdictGen != g {
+		s.rdict, s.rdictGen = buildAutomaton(s.reversePatternsLocked()), g
+	}
+	return s.rdict
+}
+
+func (s *Store) reversePatternsLocked() []acPattern {
+	keys := make([]string, 0, len(s.byKey))
+	for k := range s.byKey {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var pats []acPattern
+	for _, k := range keys {
+		e := s.byKey[k]
+		if e.kind == KindIPv4 || e.kind == KindIPv6 {
+			continue
+		}
+		bound := boundNone
+		switch {
+		case isKeywordKind(e.kind):
+			bound = boundToken
+		case e.kind == KindDomain:
+			bound = boundHost
+		case e.kind == KindEmail:
+			bound = boundEmail
+		}
+		for _, a := range append(append([]string(nil), e.retired...), e.alias) {
+			if len(a) < minLiteralLen {
+				continue
+			}
+			pats = append(pats, acPattern{text: a, original: e.original, kind: e.kind, alias: a,
+				caseSensitive: !foldKind(e.kind), bound: bound})
+		}
+	}
+	return pats
+}
+
+// provenanceOf returns the company and task ids recorded for an enrolled
+// original, with Source "auto": the provenance a value derived from it in
+// ToReal is enrolled with (ruling R4). Unknown originals give Source "auto"
+// and no ids.
+func (s *Store) provenanceOf(kind Kind, original string) Provenance {
+	p := Provenance{Source: "auto"}
+	norm, _, err := normalise(kind, original)
+	if err != nil {
+		return p
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if e := s.byKey[string(kind)+"\x00"+norm]; e != nil {
+		p.CompanyIDs = slices.Clone(e.companyIDs)
+		p.TaskIDs = slices.Clone(e.taskIDs)
+	}
+	return p
 }

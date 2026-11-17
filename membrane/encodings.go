@@ -1,6 +1,7 @@
 package membrane
 
 import (
+	"fmt"
 	"html"
 	"regexp"
 	"strings"
@@ -258,4 +259,91 @@ func (v view) toRaw(raw string, sp Span) (Span, bool) {
 	}
 	out.Encoding = v.enc
 	return out, true
+}
+
+// viewOf decodes raw with the decoder of enc.
+func viewOf(raw string, enc Encoding) (view, bool) {
+	switch enc {
+	case EncURL:
+		return urlView(raw)
+	case EncJSONEscape:
+		return jsonView(raw)
+	case EncHTMLEntity:
+		return htmlView(raw)
+	}
+	return view{}, false
+}
+
+// encodeLike writes val in encoding enc, mirroring how src (an encoded raw
+// span) wrote each character: a character src escaped is escaped the same
+// way, one src kept literal stays literal, and any other character is
+// escaped only when enc requires it. Format-preserving aliases keep their
+// punctuation in place, so a value and its alias round-trip byte-exactly.
+func encodeLike(src string, enc Encoding, val string) string {
+	if enc == EncRaw || enc == EncBasicAuth {
+		return val
+	}
+	forms := map[string]string{} // decoded unit -> raw form, first wins
+	if v, ok := viewOf(src, enc); ok {
+		for i := 0; i < len(v.text); {
+			j := i + 1
+			for j < len(v.text) && v.rs[j] == v.rs[i] {
+				j++
+			}
+			d := v.text[i:j]
+			if _, seen := forms[d]; !seen {
+				forms[d] = src[v.rs[i]:v.re[i]]
+			}
+			i = j
+		}
+	}
+	var b strings.Builder
+	for i := 0; i < len(val); {
+		r, n := utf8.DecodeRuneInString(val[i:])
+		u := val[i : i+n]
+		if f, ok := forms[u]; ok {
+			b.WriteString(f)
+		} else if enc == EncURL && n > 1 {
+			for k := i; k < i+n; k++ {
+				if f, ok := forms[val[k:k+1]]; ok {
+					b.WriteString(f)
+				} else {
+					b.WriteString(defaultEscape(enc, val[k:k+1], r))
+				}
+			}
+		} else {
+			b.WriteString(defaultEscape(enc, u, r))
+		}
+		i += n
+	}
+	return b.String()
+}
+
+// defaultEscape escapes unit u (rune r) only when enc requires it.
+func defaultEscape(enc Encoding, u string, r rune) string {
+	switch enc {
+	case EncURL:
+		var b strings.Builder
+		for k := 0; k < len(u); k++ {
+			c := u[k]
+			if c <= ' ' || c >= 0x7f || strings.IndexByte(`%&+#=?"`, c) >= 0 {
+				fmt.Fprintf(&b, "%%%02X", c)
+			} else {
+				b.WriteByte(c)
+			}
+		}
+		return b.String()
+	case EncJSONEscape:
+		switch {
+		case r == '"':
+			return `\"`
+		case r == '\\':
+			return `\\`
+		case r < 0x20:
+			return fmt.Sprintf(`\u%04x`, r)
+		}
+	case EncHTMLEntity:
+		return html.EscapeString(u)
+	}
+	return u
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -25,7 +26,16 @@ var nonPublicV4 = []netip.Prefix{
 	netip.MustParsePrefix("240.0.0.0/4"), // alias space itself, incl. broadcast
 }
 
-var aliasSpaceV6 = netip.MustParsePrefix("2001:db8::/32")
+var (
+	aliasSpaceV4 = netip.MustParsePrefix("240.0.0.0/4")
+	aliasSpaceV6 = netip.MustParsePrefix("2001:db8::/32")
+)
+
+// inAliasSpace reports whether a lies in the IPv4 or IPv6 alias block.
+func inAliasSpace(a netip.Addr) bool {
+	a = a.Unmap()
+	return aliasSpaceV4.Contains(a) || aliasSpaceV6.Contains(a)
+}
 
 // isPublicIP reports whether a is a publicly routable address that must be
 // aliased. Private, loopback, link-local (incl. 169.254.169.254), CGNAT, ULA,
@@ -112,6 +122,7 @@ func (s *Store) allocate(real netip.Prefix) (ipBlock, error) {
 		}
 	}
 	s.blocks = append(s.blocks, b)
+	s.gen.Add(1)
 	return b, nil
 }
 
@@ -219,4 +230,49 @@ func (s *Store) CIDRReal(alias netip.Prefix) (netip.Prefix, bool) {
 		}
 	}
 	return netip.Prefix{}, false
+}
+
+// blockAlias returns the alias prefix of the block allocated for exactly the
+// real prefix p.
+func (s *Store) blockAlias(p netip.Prefix) (netip.Prefix, bool) {
+	p = p.Masked()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, b := range s.blocks {
+		if b.real == p {
+			return b.alias, true
+		}
+	}
+	return netip.Prefix{}, false
+}
+
+// ipProvenance returns the provenance a real address derived through its
+// block is enrolled with (ruling R4): that of the first enrolled address in
+// the same block (blocks carry no provenance of their own), Source "auto".
+func (s *Store) ipProvenance(real netip.Addr) Provenance {
+	p := Provenance{Source: "auto"}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	blk, ok := coveringBlock(s.blocks, real)
+	if !ok {
+		return p
+	}
+	var best *entry
+	for _, e := range s.byKey {
+		if e.kind != KindIPv4 {
+			continue
+		}
+		a, err := netip.ParseAddr(e.original)
+		if err != nil || !blk.real.Contains(a) {
+			continue
+		}
+		if best == nil || e.id < best.id {
+			best = e
+		}
+	}
+	if best != nil {
+		p.CompanyIDs = slices.Clone(best.companyIDs)
+		p.TaskIDs = slices.Clone(best.taskIDs)
+	}
+	return p
 }
