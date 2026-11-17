@@ -503,3 +503,42 @@ func TestDictionaryDomainHostBoundary(t *testing.T) {
 	noSpan(t, text, spans, "notacme")
 	wantSpan(t, text, spans, "portal.acme.pt", KindDomain, "portal.acme.pt", EncRaw)
 }
+
+// Fix round 2 regressions (reviewer probe inputs).
+
+func TestDetectURLPasswordWithSubDelims(t *testing.T) {
+	p := NewPipeline(nil)
+	for _, c := range []struct{ text, user, pass string }{
+		{"postgres://admin:Pa,ss99@db.acme.pt/x", "admin", "Pa,ss99"},
+		{"postgres://admin:hun;ter2@db.acme.pt/x", "admin", "hun;ter2"},
+		{"mysql://root:p(a)ss1@10.0.0.1/db", "root", "p(a)ss1"},
+		{"https://admin:S3cr3t!{x}@portal.acme.pt/", "admin", "S3cr3t!{x}"},
+	} {
+		spans := detectAll(t, p, c.text)
+		wantSpan(t, c.text, spans, c.user, KindUsername, c.user, EncRaw)
+		wantSpan(t, c.text, spans, c.pass, KindPassword, c.pass, EncRaw)
+		for _, sp := range spans {
+			if sp.Kind == KindEmail {
+				t.Fatalf("userinfo taken for an email in %q: %s", c.text, describe(c.text, spans))
+			}
+		}
+	}
+}
+
+func TestKVBareValueNeedsNoSpaces(t *testing.T) {
+	p := NewPipeline(nil)
+	for _, text := range []string{
+		`password = request.form["password"]`,
+		`const token = await getToken();`,
+		`password = os.getenv("DB_PASS")`,
+		`secret = cfg.secret_value`,
+		`self.password = password_hash`,
+	} {
+		if spans := detectAll(t, p, text); len(spans) != 0 {
+			t.Fatalf("code expression taken as a secret: %s", describe(text, spans))
+		}
+	}
+	text := "opts = password=hunter2x"
+	spans := detectAll(t, p, text)
+	wantSpan(t, text, spans, "hunter2x", KindPassword, "hunter2x", EncRaw)
+}

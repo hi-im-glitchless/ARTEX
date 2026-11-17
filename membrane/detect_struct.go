@@ -159,7 +159,8 @@ func emails(text string, out []Span) []Span {
 				continue
 			}
 			v := strings.ToLower(text[m[0]:m[1]])
-			if strings.HasSuffix(v, ".example") || inURLUserinfo(text, m[0]) {
+			at := m[0] + strings.IndexByte(text[m[0]:m[1]], '@')
+			if strings.HasSuffix(v, ".example") || inURLUserinfo(text, m[0], at) {
 				continue
 			}
 			out = append(out, rawSpan(text, m[0], m[1], KindEmail))
@@ -172,25 +173,36 @@ func emails(text string, out []Span) []Span {
 // a long run without separators stay linear.
 const maxUserinfoLookback = 512
 
-// inURLUserinfo reports whether position i is inside the authority of a URL
-// (scheme://user:pass@host): the '@' there ends credentials, not an email
-// address. Those are userinfoSecrets' spans.
+// inURLUserinfo reports whether the email-shaped match starting at i, with
+// its '@' at at, is really the end of URL userinfo: the '@' there ends
+// credentials, not an email address. Those are userinfoSecrets' spans.
 //
-// The look-back stops at whitespace, quotes and list or markup delimiters
-// (",;|()[]{}<>"), so "https://acme.pt,joao@gmail.com" and
-// "[docs](https://acme.pt),joao@gmail.com" keep their email. Only a bare
-// authority (no '/', '?', '#' or '@') may sit between "://" and the email.
-func inURLUserinfo(text string, i int) bool {
+//   - scheme://user:pass@ (userinfoPassTailRE ending exactly at the '@'):
+//     user and password may contain sub-delims (",;()[]{}|"), so the
+//     look-back only stops at whitespace, quotes and <>.
+//   - scheme://user@ : the look-back also stops at list and markup
+//     delimiters, so "https://acme.pt,joao@gmail.com" and
+//     "[docs](https://acme.pt),joao@gmail.com" keep their email. Only a
+//     bare authority (no '/', '?', '#' or '@') may sit between "://" and i.
+func inURLUserinfo(text string, i, at int) bool {
 	lo := max(0, i-maxUserinfoLookback)
+	wide := lo + strings.LastIndexAny(text[lo:i], userinfoHardStops) + 1
+	if strings.Contains(text[wide:i], "://") && userinfoPassTailRE.MatchString(text[wide:at+1]) {
+		return true
+	}
 	ls := lo + strings.LastIndexAny(text[lo:i], userinfoStops) + 1
 	prefix := text[ls:i]
 	j := strings.LastIndex(prefix, "://")
 	return j > 0 && !strings.ContainsAny(prefix[j+3:], "/?#@")
 }
 
-// userinfoStops are bytes that cannot occur in a URL authority as written in
-// prose; userinfoRE excludes the same set.
-const userinfoStops = " \t\r\n\"'<>,;|()[]{}"
+// userinfoHardStops can never occur inside a URL authority; userinfoStops
+// adds the delimiters a username-only authority is not expected to contain
+// in prose (userinfoUserRE excludes the same set).
+const (
+	userinfoHardStops = " \t\r\n\"'<>"
+	userinfoStops     = userinfoHardStops + ",;|()[]{}"
+)
 
 // ipv4s reports public dotted quads. Like middlehack's IPV4_RE, a quad that
 // is part of a longer dotted number (1.2.3.4.5) is ignored; a trailing

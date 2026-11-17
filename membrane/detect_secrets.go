@@ -481,11 +481,13 @@ func jsonKeySecrets(text string, out []Span) []Span {
 	return out
 }
 
-// kvRE matches query, form, env and assignment style key=value pairs,
-// including `KEY = "quoted value"`. A bare value never starts with '='
-// (comparisons such as "pass == x").
-var kvRE = regexp.MustCompile(`(?:^|[?&;\s,(])([A-Za-z_][A-Za-z0-9_.\-\[\]]{0,40})[ \t]*=[ \t]*` +
-	quotedOr(`[^&\s;,"'<>#)=][^&\s;,"'<>#)]*`))
+// kvRE matches query, form, env and assignment style key=value pairs.
+// Spaces around '=' are allowed only before a quoted value
+// (`KEY = "value"`): a spaced bare value is code (`password = os.getenv(`),
+// not a literal. A bare value never starts with '=' (`pass == x`).
+// Groups: 1 key, 2 "double", 3 'single', 4 bare (the quotedOr layout).
+var kvRE = regexp.MustCompile(`(?:^|[?&;\s,(])([A-Za-z_][A-Za-z0-9_.\-\[\]]{0,40})` +
+	`(?:[ \t]*=[ \t]*(?:"([^"\n]*)"|'([^'\n]*)')|=([^&\s;,"'<>#)=][^&\s;,"'<>#)]*))`)
 
 func kvSecrets(text string, out []Span) []Span {
 	for _, m := range lineMatches(kvRE, text, lineHas(text, "=")) {
@@ -525,19 +527,30 @@ func quotedValue(text string, s, e int, k Kind, out []Span) []Span {
 	return out
 }
 
-// userinfoRE matches scheme://user[:pass]@ in URLs. The userinfo classes
-// exclude the delimiters inURLUserinfo stops at.
-var userinfoRE = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://([^/\s:@'"<>,;|()\[\]{}]+)(?::([^/\s@'"<>,;|()\[\]{}]+))?@`)
+// URL userinfo. The scheme://user:pass@ form is unambiguous, so user and
+// password take any byte but '/', whitespace, '@', quotes and <> (generated
+// passwords use RFC 3986 sub-delims such as ",;()[]{}"). A username-only
+// scheme://user@ is narrower and stops at the delimiters inURLUserinfo
+// stops at, so "https://acme.pt,joao@gmail.com" stays an email.
+var (
+	userinfoPassRE = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://([^/\s:@'"<>]+):([^/\s@'"<>]+)@`)
+	userinfoUserRE = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://([^/\s:@'"<>,;|()\[\]{}]+)@`)
+	// userinfoPassTailRE: text ending in a scheme://user:pass@ authority.
+	userinfoPassTailRE = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@'"<>]+:[^/\s@'"<>]+@$`)
+)
 
 func userinfoSecrets(text string, out []Span) []Span {
-	for _, m := range lineMatches(userinfoRE, text, lineHas(text, "://")) {
+	pre := lineHas(text, "://")
+	for _, m := range lineMatches(userinfoPassRE, text, pre) {
 		if sp, ok := valueSpan(text, m[2], m[3], KindUsername); ok {
 			out = append(out, sp)
 		}
-		if m[4] < 0 {
-			continue // username only (https://joao.silva@host)
-		}
 		if sp, ok := valueSpan(text, m[4], m[5], KindPassword); ok {
+			out = append(out, sp)
+		}
+	}
+	for _, m := range lineMatches(userinfoUserRE, text, pre) {
+		if sp, ok := valueSpan(text, m[2], m[3], KindUsername); ok {
 			out = append(out, sp)
 		}
 	}
