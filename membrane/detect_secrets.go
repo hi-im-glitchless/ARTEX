@@ -141,10 +141,51 @@ func shapedValue(v string) bool {
 // too short (min length 3) or shaped.
 func valueSpan(text string, s, e int, k Kind) (Span, bool) {
 	v := text[s:e]
-	if utf8.RuneCountInString(v) < minLiteralLen || shapedValue(v) {
+	if utf8.RuneCountInString(v) < minLiteralLen || shapedValue(v) || placeholderValue(v) {
 		return Span{}, false
 	}
 	return Span{Start: s, End: e, Kind: k, Value: v}, true
+}
+
+// placeholderWords are type names and stock example values that sit in
+// secret fields of schemas, docs and templates ({"password": "string"}).
+// Enrolling them would alias the word everywhere (`"type":"string"`).
+var placeholderWords = map[string]bool{
+	"string": true, "number": true, "integer": true, "int": true, "float": true,
+	"boolean": true, "bool": true, "null": true, "nil": true, "true": true,
+	"false": true, "none": true, "undefined": true, "object": true, "array": true,
+	"password": true, "passwd": true, "secret": true, "token": true, "apikey": true,
+	"api_key": true, "changeme": true, "change_me": true, "changeit": true,
+	"example": true, "sample": true, "value": true, "redacted": true,
+	"hidden": true, "masked": true, "placeholder": true, "dummy": true, "todo": true,
+	"username": true, "user": true, "test": true, "empty": true,
+}
+
+// placeholderValue reports a value that is a template or placeholder, not a
+// secret: a placeholder word, one character repeated (xxx, ****, ...), a
+// value wrapped in <> {} {{}} ${} [] or %%, or "your_..." text.
+func placeholderValue(v string) bool {
+	t := strings.ToLower(strings.TrimSpace(v))
+	if placeholderWords[t] {
+		return true
+	}
+	for _, p := range []string{"your_", "your-", "your ", "yourpass", "yourtoken", "yourkey", "yoursecret", "yourapi"} {
+		if strings.HasPrefix(t, p) {
+			return true
+		}
+	}
+	if len(t) >= 2 {
+		pairs := [][2]string{{"<", ">"}, {"{", "}"}, {"${", "}"}, {"[", "]"}, {"%", "%"}, {"$(", ")"}}
+		for _, p := range pairs {
+			if strings.HasPrefix(t, p[0]) && strings.HasSuffix(t, p[1]) {
+				return true
+			}
+		}
+	}
+	if t != "" && strings.Trim(t, t[:1]) == "" && strings.ContainsAny(t[:1], "x*.-_#?") {
+		return true
+	}
+	return false
 }
 
 // Known secret formats (cockpit _SECRET_RES plus common vendor prefixes).

@@ -779,24 +779,54 @@ func (s *Store) mintEmail(norm string, attempt int, prov Provenance, look bool) 
 func (s *Store) AliasFor(original string) (alias string, kind Kind, ok bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if e := s.origSens[original]; e != nil {
+	if e := s.entryForLocked(original); e != nil {
 		return e.alias, e.kind, true
+	}
+	return "", "", false
+}
+
+// entryForLocked finds the entry of an enrolled original, kind-agnostic.
+// Caller holds mu.
+func (s *Store) entryForLocked(original string) *entry {
+	if e := s.origSens[original]; e != nil {
+		return e
 	}
 	t := strings.TrimSpace(original)
 	if e := s.origFold[strings.ToLower(t)]; e != nil {
-		return e.alias, e.kind, true
+		return e
 	}
 	if d, err := normDomain(t); err == nil {
 		if e := s.origFold[d]; e != nil {
-			return e.alias, e.kind, true
+			return e
 		}
 	}
 	if a, err := netip.ParseAddr(t); err == nil {
 		if e := s.origSens[a.Unmap().String()]; e != nil {
-			return e.alias, e.kind, true
+			return e
 		}
 	}
-	return "", "", false
+	return nil
+}
+
+// noteUse records that an enrolled original was seen under prov: company and
+// task ids it does not carry yet are merged and persisted, so a purge of one
+// company never removes a value another company still relies on. The check
+// is in memory; only a missing id costs a write. Unknown originals and an
+// empty prov are a no-op.
+func (s *Store) noteUse(original string, prov Provenance) error {
+	if len(prov.CompanyIDs) == 0 && len(prov.TaskIDs) == 0 {
+		return nil
+	}
+	s.mu.RLock()
+	e := s.entryForLocked(original)
+	covered := e == nil || (containsAll(e.companyIDs, prov.CompanyIDs) && containsAll(e.taskIDs, prov.TaskIDs))
+	s.mu.RUnlock()
+	if covered {
+		return nil
+	}
+	s.enrollMu.Lock()
+	defer s.enrollMu.Unlock()
+	return s.mergeProvenance(e, prov)
 }
 
 // OriginalFor returns the original of an exactly known alias, kind-agnostic.
@@ -892,8 +922,20 @@ func patternBound(k Kind, text string) boundMode {
 		return boundHost
 	case k == KindEmail:
 		return boundEmail
+	case isCredentialKind(k) && utf8.RuneCountInString(text) < shortCredentialMax:
+		return boundToken
 	}
 	return boundNone
+}
+
+// shortCredentialMax: usernames, passwords and tokens shorter than this
+// (in runes) match only as whole tokens, forward, in the leak check and in
+// reverse; a short value or its alias occurs by chance inside other words
+// and numbers (bob in bobby, 1234 in 12345).
+const shortCredentialMax = 8
+
+func isCredentialKind(k Kind) bool {
+	return k == KindUsername || k == KindPassword || k == KindToken
 }
 
 func (s *Store) patternsLocked() []acPattern {
@@ -961,18 +1003,13 @@ func (s *Store) reversePatternsLocked() []acPattern {
 		if e.kind == KindIPv4 || e.kind == KindIPv6 {
 			continue
 		}
-		bound := boundNone
-		switch {
-		case isKeywordKind(e.kind):
-			bound = boundToken
-		case e.kind == KindDomain:
-			bound = boundHost
-		case e.kind == KindEmail:
-			bound = boundEmail
-		}
 		for _, a := range append(append([]string(nil), e.retired...), e.alias) {
 			if len(a) < minLiteralLen {
 				continue
+			}
+			bound := patternBound(e.kind, a) // aliases keep the original's length
+			if isKeywordKind(e.kind) {
+				bound = boundToken
 			}
 			pats = append(pats, acPattern{text: a, original: e.original, kind: e.kind, alias: a,
 				caseSensitive: !foldKind(e.kind), bound: bound})

@@ -195,7 +195,7 @@ func (e *Engine) ToModelRequest(req llm.CompletionRequest, prov Provenance) (llm
 	if req.Messages != nil {
 		out.Messages = make([]llm.Message, len(req.Messages))
 		for i, m := range req.Messages {
-			c, err := e.blocksToModel(m.Content, prov, &rep)
+			c, err := e.blocksToModel(m.Content, prov, m.Role == llm.RoleAssistant, &rep)
 			if err != nil {
 				return llm.CompletionRequest{}, Report{}, err
 			}
@@ -211,7 +211,10 @@ func (e *Engine) ToModelRequest(req llm.CompletionRequest, prov Provenance) (llm
 	return out, rep, nil
 }
 
-func (e *Engine) blocksToModel(bs []llm.ContentBlock, prov Provenance, rep *Report) ([]llm.ContentBlock, error) {
+// blocksToModel transforms blocks; assistant marks the text and thinking of
+// an assistant message (ruling R12). tool_use input and tool_result content
+// are never assistant prose.
+func (e *Engine) blocksToModel(bs []llm.ContentBlock, prov Provenance, assistant bool, rep *Report) ([]llm.ContentBlock, error) {
 	if bs == nil {
 		return nil, nil
 	}
@@ -219,7 +222,7 @@ func (e *Engine) blocksToModel(bs []llm.ContentBlock, prov Provenance, rep *Repo
 		if s == "" {
 			return s, nil
 		}
-		t, r, err := e.ToModel(s, prov)
+		t, r, err := e.toModelRole(s, prov, assistant)
 		rep.merge(r)
 		return t, err
 	}
@@ -241,7 +244,7 @@ func (e *Engine) blocksToModel(bs []llm.ContentBlock, prov Provenance, rep *Repo
 			rep.merge(r)
 			nb.Input = slices.Clone(in)
 		}
-		if nb.Content, err = e.blocksToModel(b.Content, prov, rep); err != nil {
+		if nb.Content, err = e.blocksToModel(b.Content, prov, false, rep); err != nil {
 			return nil, err
 		}
 		out[i] = nb

@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/net/publicsuffix"
@@ -54,10 +55,16 @@ func (e *Engine) toReal(text string, depth int) (string, []string) {
 	rd := e.s.ReverseDictionary()
 	var cands []rCand
 	for _, m := range rd.FindAll(text) {
+		if !hostSuffixOK(text, m) {
+			continue
+		}
 		cands = append(cands, rCand{Start: m.Start, End: m.End, repl: reverseText(text[m.Start:m.End], m), prio: prioExact})
 	}
 	for _, v := range decodedViews(text) {
 		for _, m := range rd.FindAll(v.text) {
+			if !hostSuffixOK(v.text, m) {
+				continue
+			}
 			sp, ok := v.toRaw(text, Span{Start: m.Start, End: m.End})
 			if !ok || sp.Encoding == EncRaw {
 				continue
@@ -102,10 +109,17 @@ func (e *Engine) toReal(text string, depth int) (string, []string) {
 	b.WriteString(text[last:])
 
 	e.markModelDomains(text, kept)
-	for _, u := range unresolved {
-		e.markEmitted(u)
-	}
 	return b.String(), unresolved
+}
+
+// hostSuffixOK rejects a domain or email alias match that does not end its
+// host: in evil.ffcc79.example.attacker.com or ffcc79.example.evil.com the
+// alias is a label sequence of someone else's host, not client space.
+func hostSuffixOK(t string, m Match) bool {
+	if m.Kind != KindDomain && m.Kind != KindEmail {
+		return true
+	}
+	return !(byteAfter(t, m.End) == '.' && isHostByte(byteAfter(t, m.End+1)))
 }
 
 // reverseText is the original for alias match m written as matched. A
@@ -226,27 +240,66 @@ func (e *Engine) enrolDerivedIP(real netip.Addr) {
 
 var basicRE = regexp.MustCompile(`(?i)\bbasic[ \t]+([A-Za-z0-9+/]{4,}={0,2})`)
 
-// basicCandidates de-aliases "Basic <base64(user:pass)>" credentials.
-func (e *Engine) basicCandidates(text string, depth int) []rCand {
+// basicToken is a "Basic <base64(user:pass)>" credential anywhere in text
+// (an Authorization header, WWW-Authenticate, prose): text[Start:End] is the
+// base64, plain the decoded credential.
+type basicToken struct {
+	Start, End int
+	plain      string
+}
+
+// basicTokens finds Basic credentials whose base64 decodes (strictly) to
+// printable text containing ':'.
+func basicTokens(text string) []basicToken {
 	if !containsFoldASCII(text, "basic") {
 		return nil
 	}
-	var out []rCand
+	var out []basicToken
 	for _, m := range basicRE.FindAllStringSubmatchIndex(text, -1) {
 		s, end := m[2], m[3]
 		if a := byteAfter(text, end); isASCIIAlnum(a) || a == '+' || a == '/' || a == '=' {
 			continue
 		}
-		enc := base64Like(text[s:end])
-		dec, err := enc.Strict().DecodeString(text[s:end])
+		dec, err := base64Like(text[s:end]).Strict().DecodeString(text[s:end])
 		if err != nil || !utf8.Valid(dec) || !strings.Contains(string(dec), ":") {
 			continue
 		}
-		inner, unresolved := e.toReal(string(dec), depth+1)
-		if inner == string(dec) && len(unresolved) == 0 {
+		printable := true
+		for _, r := range string(dec) {
+			if !unicode.IsPrint(r) {
+				printable = false
+				break
+			}
+		}
+		if printable {
+			out = append(out, basicToken{Start: s, End: end, plain: string(dec)})
+		}
+	}
+	return out
+}
+
+// basicToModelCandidates makes every Basic credential a ToModel candidate,
+// so one outside an Authorization header (WWW-Authenticate, logs, prose) is
+// aliased too.
+func basicToModelCandidates(text string) []tmCand {
+	var out []tmCand
+	for _, bt := range basicTokens(text) {
+		out = append(out, tmCand{Span: Span{Start: bt.Start, End: bt.End, Kind: KindPassword,
+			Value: bt.plain, Encoding: EncBasicAuth}, added: true, prio: 2})
+	}
+	return out
+}
+
+// basicCandidates de-aliases "Basic <base64(user:pass)>" credentials.
+func (e *Engine) basicCandidates(text string, depth int) []rCand {
+	var out []rCand
+	for _, bt := range basicTokens(text) {
+		inner, unresolved := e.toReal(bt.plain, depth+1)
+		if inner == bt.plain && len(unresolved) == 0 {
 			continue
 		}
-		out = append(out, rCand{Start: s, End: end, repl: enc.EncodeToString([]byte(inner)),
+		out = append(out, rCand{Start: bt.Start, End: bt.End,
+			repl: base64Like(text[bt.Start:bt.End]).EncodeToString([]byte(inner)),
 			prio: prioToken, unresolved: unresolved})
 	}
 	return out

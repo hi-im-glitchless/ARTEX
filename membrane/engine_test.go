@@ -215,10 +215,32 @@ func TestUnknownAliasUnresolved(t *testing.T) {
 	if got := e.AliasShaped(in); !slices.Equal(got, want) {
 		t.Fatalf("AliasShaped %v", got)
 	}
-	// Replayed into ToModel, model-emitted unknown aliases pass through
-	// (they are not real values) and are not enrolled.
-	if out := toModel(t, e, in); out != in {
-		t.Fatalf("replayed unknown aliases changed: %q", out)
+	// R12: replayed in assistant content (a fresh engine, as after a
+	// restart), unminted alias-shaped tokens pass through and are not
+	// enrolled; hosts under a minted root are alias space everywhere.
+	s := e.s
+	ra := mustAlias(t, s, "acmebank.pt")
+	asst := in + " and org-ffff." + ra + " and dev.ffffff.example and 240.9.9.9"
+	req := llm.CompletionRequest{Messages: []llm.Message{
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockText, Text: asst}, {Type: llm.BlockThinking, Thinking: asst}}},
+	}}
+	out, _, err := NewEngine(s, nil).ToModelRequest(req, Provenance{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := out.Messages[0].Content[0].Text; got != asst || out.Messages[0].Content[1].Thinking != asst {
+		t.Fatalf("assistant aliases changed: %q", got)
+	}
+	for _, tok := range []string{"ffffff.example", "ORG-ffff", "240.9.9.9", "dev.ffffff.example"} {
+		if _, _, ok := s.AliasFor(tok); ok {
+			t.Fatalf("assistant token %q enrolled", tok)
+		}
+	}
+	// In non-assistant content a host under a minted root is never enrolled
+	// and never an error.
+	user := "tool says org-ffff." + ra + " is down"
+	if got := toModel(t, NewEngine(s, nil), user); got != user {
+		t.Fatalf("host under minted root changed: %q", got)
 	}
 }
 
@@ -629,7 +651,7 @@ func BenchmarkToModel(b *testing.B) {
 	b.Run("uncached", func(b *testing.B) {
 		b.SetBytes(int64(len(text)))
 		for b.Loop() {
-			if _, _, err := e.toModel(text, Provenance{}); err != nil {
+			if _, _, err := e.toModel(text, Provenance{}, false); err != nil {
 				b.Fatal(err)
 			}
 		}

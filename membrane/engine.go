@@ -8,8 +8,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
-	"sync/atomic"
 )
 
 // Engine rewrites text between the real universe and the alias universe:
@@ -20,25 +18,15 @@ type Engine struct {
 	s     *Store
 	p     *Pipeline
 	cache *toModelCache
-
-	// emitted holds alias-shaped tokens the model produced that ToReal could
-	// not resolve. When conversation history replays them through ToModel
-	// they are passed through: they are model output, not real values.
-	emu     sync.Mutex
-	emitted map[string]bool
-	egen    atomic.Uint64 // bumped when emitted grows (part of the cache key)
 }
 
-// maxEmitted bounds the emitted set; beyond it new tokens are not recorded
-// (they are then enrolled as real values on replay, which is safe).
-const maxEmitted = 65536
-
-// NewEngine returns an engine over s. p may be nil (NewPipeline(s)).
+// NewEngine returns an engine over s (required). p may be nil
+// (NewPipeline(s)).
 func NewEngine(s *Store, p *Pipeline) *Engine {
 	if p == nil {
 		p = NewPipeline(s)
 	}
-	return &Engine{s: s, p: p, cache: newToModelCache(), emitted: map[string]bool{}}
+	return &Engine{s: s, p: p, cache: newToModelCache()}
 }
 
 // Report summarises one ToModel call. Counts is per kind of replaced value,
@@ -102,40 +90,48 @@ type LeakHit struct {
 }
 
 // generation changes whenever a cached ToModel result may be stale.
-func (e *Engine) generation() uint64 { return e.s.generation() + e.egen.Load() }
+func (e *Engine) generation() uint64 { return e.s.generation() }
 
-func (e *Engine) markEmitted(tok string) {
-	k := strings.ToLower(tok)
-	e.emu.Lock()
-	defer e.emu.Unlock()
-	if !e.emitted[k] && len(e.emitted) < maxEmitted {
-		e.emitted[k] = true
-		e.egen.Add(1)
-	}
-}
-
-func (e *Engine) isEmitted(tok string) bool {
-	k := strings.ToLower(tok)
-	e.emu.Lock()
-	defer e.emu.Unlock()
-	return e.emitted[k]
-}
-
-// ToModel rewrites text into the alias universe. Every detected value with
-// no alias yet is enrolled with prov; real values shaped like aliases are
-// enrolled too (ruling R11); aliases the store minted pass through. Results
-// are cached per (text, store generation), so replayed history is not
+// ToModel rewrites text into the alias universe. text is treated as
+// non-assistant content (system, user, tool output). Every detected value
+// with no alias yet is enrolled with prov (and prov is merged into values
+// already enrolled); real values shaped like aliases are enrolled too
+// (ruling R11); aliases the store minted pass through. Results are cached
+// per (text, role, provenance, store generation), so replayed history is not
 // rescanned. Errors never contain originals; on error nothing must be sent.
 func (e *Engine) ToModel(text string, prov Provenance) (string, Report, error) {
+	return e.toModelRole(text, prov, false)
+}
+
+// cacheKey hashes everything a ToModel result depends on besides the store
+// generation.
+func cacheKey(text string, prov Provenance, assistant bool) [32]byte {
+	h := sha256.New()
+	if assistant {
+		h.Write([]byte{1})
+	} else {
+		h.Write([]byte{0})
+	}
+	fmt.Fprintf(h, "%v|%v|%s|", prov.CompanyIDs, prov.TaskIDs, prov.Source)
+	h.Write([]byte(text))
+	var k [32]byte
+	copy(k[:], h.Sum(nil))
+	return k
+}
+
+// toModelRole is ToModel with the message role: in assistant text and
+// thinking (assistant true), alias-shaped tokens the store did not mint are
+// the model's own words and pass through, never enrolled (ruling R12).
+func (e *Engine) toModelRole(text string, prov Provenance, assistant bool) (string, Report, error) {
 	if text == "" {
 		return "", newReport(), nil
 	}
-	key := sha256.Sum256([]byte(text))
+	key := cacheKey(text, prov, assistant)
 	g := e.generation()
 	if out, rep, ok := e.cache.get(key, g); ok {
 		return out, rep, nil
 	}
-	out, rep, err := e.toModel(text, prov)
+	out, rep, err := e.toModel(text, prov, assistant)
 	if err != nil {
 		return "", Report{}, err
 	}
@@ -148,12 +144,14 @@ func (e *Engine) ToModel(text string, prov Provenance) (string, Report, error) {
 	return out, rep, nil
 }
 
-// tmCand is a ToModel replacement candidate: a pipeline span or (look) a
-// real value shaped like an alias.
+// tmCand is a ToModel replacement candidate: a pipeline span, or one the
+// engine adds (added): a real value shaped like an alias (look), or a Basic
+// credential outside an Authorization header.
 type tmCand struct {
 	Span
-	look bool
-	prio int
+	look  bool
+	added bool
+	prio  int
 }
 
 func (c tmCand) bounds() (int, int, int) { return c.Start, c.End, c.prio }
@@ -166,11 +164,11 @@ const maxPasses = 4
 // email enrols its domain as a client root; a keyword re-mints hosts), so a
 // pass that enrolled anything is redone on the original text with the
 // grown dictionary. Enrolled sums all passes.
-func (e *Engine) toModel(text string, prov Provenance) (string, Report, error) {
+func (e *Engine) toModel(text string, prov Provenance, assistant bool) (string, Report, error) {
 	enrolled := 0
 	for pass := 1; ; pass++ {
 		g := e.generation()
-		out, rep, err := e.transformPass(text, prov)
+		out, rep, err := e.transformPass(text, prov, assistant)
 		if err != nil {
 			return "", Report{}, err
 		}
@@ -182,11 +180,15 @@ func (e *Engine) toModel(text string, prov Provenance) (string, Report, error) {
 	}
 }
 
-func (e *Engine) transformPass(text string, prov Provenance) (string, Report, error) {
+func (e *Engine) transformPass(text string, prov Provenance, assistant bool) (string, Report, error) {
 	rep := newReport()
 	var b strings.Builder
 	last := 0
-	for _, c := range mergeLookalikes(e.p.Detect(text), e.lookalikes(text)) {
+	extra := basicToModelCandidates(text)
+	if !assistant {
+		extra = append(extra, e.lookalikes(text)...)
+	}
+	for _, c := range mergeAdded(e.p.Detect(text), extra) {
 		raw := text[c.Start:c.End]
 		repl, err := e.replacement(text, c, prov, &rep)
 		if err != nil {
@@ -242,13 +244,16 @@ func (e *Engine) replacement(text string, c tmCand, prov Provenance, rep *Report
 }
 
 // aliasValue returns the alias of a detected value, enrolling it when it
-// has none. keep is true when v must stay as written: it is already an
-// alias the store minted, or an unresolved alias the model emitted.
+// has none and merging prov into it when it has. keep is true when v must
+// stay as written: it is already an alias the store minted.
 func (e *Engine) aliasValue(kind Kind, v string, prov Provenance, rep *Report) (alias string, keep bool, err error) {
 	if a, _, ok := e.s.AliasFor(v); ok {
+		if err := e.s.noteUse(v, prov); err != nil {
+			return "", false, fmt.Errorf("membrane to_model: %w", err)
+		}
 		return a, false, nil
 	}
-	if _, _, ok := e.s.OriginalFor(v); ok || e.isEmitted(v) {
+	if _, _, ok := e.s.OriginalFor(v); ok {
 		return "", true, nil
 	}
 	if kind == KindIPv4 {
@@ -276,6 +281,9 @@ func (e *Engine) aliasValue(kind Kind, v string, prov Provenance, rep *Report) (
 // enrolLookalike aliases a real value shaped like an alias (ruling R11).
 func (e *Engine) enrolLookalike(kind Kind, v string, prov Provenance, rep *Report) (string, error) {
 	if a, _, ok := e.s.AliasFor(v); ok {
+		if err := e.s.noteUse(v, prov); err != nil {
+			return "", fmt.Errorf("membrane to_model: %w", err)
+		}
 		return a, nil
 	}
 	a, err := e.s.enrollLookalike(kind, v, prov)
@@ -345,27 +353,26 @@ func inHostToken(text string, s, e int) bool {
 	return i > 0 && i < len(tok)-1
 }
 
-// lookalikes returns ToModel candidates for alias-shaped tokens that the
-// store did not mint and the model did not emit: real values (ruling R11).
-// A minted alias, or a value derivable from one (a host under a root alias,
-// an address inside an allocated block), passes through (ruling R5).
+// lookalikes returns ToModel candidates for alias-shaped tokens in
+// non-assistant content that the store did not mint: real values (ruling
+// R11). A minted alias, or a value derivable from one (an address inside an
+// allocated block), passes through (ruling R5). A host whose suffix is a
+// minted domain alias is alias space whatever its labels (ruling R12):
+// never enrolled, never an error.
 func (e *Engine) lookalikes(text string) []tmCand {
 	var out []tmCand
 	add := func(s, end int, k Kind) {
-		out = append(out, tmCand{Span: Span{Start: s, End: end, Kind: k, Value: text[s:end]}, look: true, prio: 1})
+		out = append(out, tmCand{Span: Span{Start: s, End: end, Kind: k, Value: text[s:end]}, look: true, added: true, prio: 1})
 	}
 	for _, sh := range scanShapes(text) {
-		if e.isEmitted(sh.text) {
-			continue
-		}
 		switch sh.kind {
 		case shapeHost:
-			if _, ok := e.resolveHost(sh.text, false); ok {
+			if e.underMintedDomain(sh.text) {
 				continue
 			}
 			if ls := emailLocalStart(text, sh.Start); ls >= 0 {
 				email := text[ls:sh.End]
-				if _, _, ok := e.s.OriginalFor(email); ok || e.isEmitted(email) {
+				if _, _, ok := e.s.OriginalFor(email); ok {
 					continue
 				}
 				add(ls, sh.End, KindEmail)
@@ -399,14 +406,26 @@ func (e *Engine) lookalikes(text string) []tmCand {
 	return out
 }
 
-// mergeLookalikes combines the pipeline's (non-overlapping) spans with
-// lookalike candidates. A lookalike replaces the pipeline spans it fully
-// contains (its enrolment aliases everything inside it); one that only
-// partly overlaps a pipeline span is dropped, because the pipeline has
-// already discarded the shorter alternatives around that span and dropping
-// it would let them through in clear. Longer lookalikes win among
-// themselves. The result is ordered by Start.
-func mergeLookalikes(spans []Span, looks []tmCand) []tmCand {
+// underMintedDomain reports whether host, or a suffix of it, is a minted
+// domain alias (current or retired).
+func (e *Engine) underMintedDomain(host string) bool {
+	labels := strings.Split(host, ".")
+	for i := 0; i+2 <= len(labels); i++ {
+		if _, k, ok := e.s.OriginalFor(strings.Join(labels[i:], ".")); ok && k == KindDomain {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeAdded combines the pipeline's (non-overlapping) spans with the
+// candidates the engine adds. An added candidate replaces the pipeline spans
+// it fully contains (its replacement aliases everything inside it); one
+// that only partly overlaps a pipeline span is dropped, because the
+// pipeline has already discarded the shorter alternatives around that span
+// and dropping it would let them through in clear. Longer added candidates
+// win among themselves. The result is ordered by Start.
+func mergeAdded(spans []Span, looks []tmCand) []tmCand {
 	sort.SliceStable(looks, func(i, j int) bool {
 		return looks[i].End-looks[i].Start > looks[j].End-looks[j].Start
 	})
@@ -421,7 +440,7 @@ next:
 			if c.Start >= l.End || l.Start >= c.End {
 				continue
 			}
-			if c.look || c.Start < l.Start || c.End > l.End {
+			if c.added || c.Start < l.Start || c.End > l.End {
 				continue next
 			}
 			inside = append(inside, i)
@@ -525,9 +544,24 @@ func (e *Engine) LeakCheck(serialised []byte) []LeakHit {
 			}
 		}
 	}
+	// tokens scans the base64 views: JWT header and payload, Basic
+	// credentials (spec §7.2/§9.1). A hit is reported at the token's start.
+	tokens := func(t string, toRaw func(int) int) {
+		for _, jt := range jwtTokens(t) {
+			at := toRaw(jt.Start)
+			scan(string(jt.header), func(int) int { return at })
+			scan(string(jt.payload), func(int) int { return at })
+		}
+		for _, bt := range basicTokens(t) {
+			at := toRaw(bt.Start)
+			scan(bt.plain, func(int) int { return at })
+		}
+	}
 	scan(text, func(i int) int { return i })
+	tokens(text, func(i int) int { return i })
 	for _, v := range decodedViews(text) {
 		scan(v.text, func(i int) int { return v.rs[i] })
+		tokens(v.text, func(i int) int { return v.rs[i] })
 	}
 	sort.Slice(hits, func(i, j int) bool {
 		if hits[i].Offset != hits[j].Offset {
