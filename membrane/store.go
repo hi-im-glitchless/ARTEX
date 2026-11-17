@@ -803,6 +803,21 @@ func (s *Store) Dictionary() *Automaton {
 	return s.dict
 }
 
+// patternBound picks the neighbour rule for a dictionary pattern: short
+// keywords match as whole tokens (ruling R10), domains and emails only at
+// host-label boundaries so they never match inside another host.
+func patternBound(k Kind, text string) boundMode {
+	switch {
+	case isKeywordKind(k) && utf8.RuneCountInString(text) <= shortKeywordMax:
+		return boundToken
+	case k == KindDomain:
+		return boundHost
+	case k == KindEmail:
+		return boundEmail
+	}
+	return boundNone
+}
+
 func (s *Store) patternsLocked() []acPattern {
 	keys := make([]string, 0, len(s.byKey))
 	for k := range s.byKey {
@@ -815,8 +830,7 @@ func (s *Store) patternsLocked() []acPattern {
 			return
 		}
 		pats = append(pats, acPattern{text: text, original: e.original, kind: e.kind,
-			alias: e.alias, caseSensitive: !foldKind(e.kind),
-			boundary: isKeywordKind(e.kind) && utf8.RuneCountInString(text) <= shortKeywordMax})
+			alias: e.alias, caseSensitive: !foldKind(e.kind), bound: patternBound(e.kind, text)})
 	}
 	for _, k := range keys {
 		e := s.byKey[k]

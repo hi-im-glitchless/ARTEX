@@ -409,3 +409,97 @@ func BenchmarkPipelineDetect(b *testing.B) {
 		})
 	}
 }
+
+// Fix round 1 regressions (reviewer probe inputs).
+
+func TestDetectQuotedAssignments(t *testing.T) {
+	p := NewPipeline(nil)
+	for _, c := range []struct {
+		text, raw string
+		kind      Kind
+	}{
+		{`DB_PASSWORD="hunter2x"`, "hunter2x", KindPassword},
+		{`password = "hunter2x"`, "hunter2x", KindPassword},
+		{`export AWS_SECRET_ACCESS_KEY="abcdEFGH1234abcd"`, "abcdEFGH1234abcd", KindToken},
+		{`token='a b c d'`, "a b c d", KindToken},
+	} {
+		spans := detectAll(t, p, c.text)
+		wantSpan(t, c.text, spans, c.raw, c.kind, c.raw, EncRaw)
+	}
+}
+
+func TestDetectEmailAfterURLWithoutSpace(t *testing.T) {
+	p := NewPipeline(nil)
+	for _, text := range []string{
+		"site,email\nhttps://acmebank.pt,joao.silva@gmail.com",
+		"[docs](https://acmebank.pt),joao.silva@gmail.com",
+	} {
+		spans := detectAll(t, p, text)
+		wantSpan(t, text, spans, "joao.silva@gmail.com", KindEmail, "joao.silva@gmail.com", EncRaw)
+	}
+}
+
+func TestDetectPEMTruncatedAndPGP(t *testing.T) {
+	p := NewPipeline(nil)
+	text := "out:\n-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n"
+	spans := detectAll(t, p, text)
+	wantSpan(t, text, spans, "-----BEGIN RSA PRIVATE KEY-----\nMIIabc", KindPrivateKey, "-----BEGIN RSA PRIVATE KEY-----\nMIIabc", EncRaw)
+
+	pgp := "-----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: X\n\nlQOYBF0abc\n=abcd\n-----END PGP PRIVATE KEY BLOCK-----"
+	text = "k " + pgp + " done"
+	spans = detectAll(t, p, text)
+	wantSpan(t, text, spans, pgp, KindPrivateKey, pgp, EncRaw)
+
+	// A truncated block without END runs to the end of the armour body.
+	trunc := "-----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: X\n\nlQOYBF0abc"
+	text = trunc + "\n[output truncated]"
+	spans = detectAll(t, p, text)
+	wantSpan(t, text, spans, trunc, KindPrivateKey, trunc, EncRaw)
+}
+
+func TestDetectQuotedHeaderValues(t *testing.T) {
+	p := NewPipeline(nil)
+	for _, c := range []struct {
+		text, raw string
+		kind      Kind
+	}{
+		{"api_key: 'zzzyyyxxx'", "zzzyyyxxx", KindToken},
+		{`password: "hunter 2 x"`, "hunter 2 x", KindPassword},
+		{`the password: "hunter 2 x" is old`, "hunter 2 x", KindPassword},
+	} {
+		spans := detectAll(t, p, c.text)
+		wantSpan(t, c.text, spans, c.raw, c.kind, c.raw, EncRaw)
+		noSpan(t, c.text, spans, `"`)
+		noSpan(t, c.text, spans, "'")
+	}
+}
+
+func TestDetectUsernameOnlyUserinfo(t *testing.T) {
+	p := NewPipeline(nil)
+	text := "clone https://joao.silva@acmebank.pt/repo.git"
+	spans := detectAll(t, p, text)
+	wantSpan(t, text, spans, "joao.silva", KindUsername, "joao.silva", EncRaw)
+}
+
+func TestDictionaryDomainHostBoundary(t *testing.T) {
+	p, s := newTestPipeline(t, [2]string{"domain", "acme.pt"}, [2]string{"email", "jo@acme.pt"})
+	dict := s.Dictionary()
+	for _, text := range []string{"notacme.pt", "acme.ptx.com", "acme.pt-x.io", "jo@acme.ptx.com"} {
+		if ms := dict.FindAll(text); len(ms) != 0 {
+			t.Fatalf("dictionary matched inside %q: %+v", text, ms)
+		}
+	}
+	// Another local part: only the (real) domain matches, not the email.
+	if ms := dict.FindAll("xjo@acme.pt"); len(ms) != 1 || ms[0].Kind != KindDomain {
+		t.Fatalf("email matched inside a longer local part: %+v", ms)
+	}
+	for _, text := range []string{"acme.pt", "(acme.pt)", "portal.acme.pt", "acme.pt.", "ACME.PT/x", "jo@acme.pt,"} {
+		if ms := dict.FindAll(text); len(ms) != 1 {
+			t.Fatalf("dictionary missed %q: %+v", text, ms)
+		}
+	}
+	text := "see notacme.pt and portal.acme.pt"
+	spans := detectAll(t, p, text)
+	noSpan(t, text, spans, "notacme")
+	wantSpan(t, text, spans, "portal.acme.pt", KindDomain, "portal.acme.pt", EncRaw)
+}

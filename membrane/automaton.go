@@ -2,6 +2,7 @@ package membrane
 
 import (
 	"sort"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 )
@@ -30,24 +31,52 @@ type acPattern struct {
 	kind          Kind
 	alias         string
 	caseSensitive bool
-	// boundary requires a token boundary (text edge or a non-alphanumeric
-	// rune) on both sides of the match (ruling R10: short keywords).
-	boundary bool
+	bound         boundMode
 }
+
+// boundMode says which neighbours a match must not have.
+type boundMode uint8
+
+const (
+	boundNone boundMode = iota
+	// boundToken: no letter or digit on either side (ruling R10: keywords
+	// of 3-4 runes).
+	boundToken
+	// boundHost: no letter, digit or '-' on either side, so a domain does
+	// not match inside another host label (notacme.pt, acme.ptx.com). A '.'
+	// is a boundary: portal.acme.pt still contains acme.pt.
+	boundHost
+	// boundEmail: like boundHost on the right; on the left no byte that can
+	// belong to a local part (xjo@acme.pt is not jo@acme.pt).
+	boundEmail
+)
 
 // isAlnumRune reports whether r is a letter or digit (any script).
 func isAlnumRune(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
 
-// atTokenBoundary reports whether text[start:end] has no letter or digit
-// directly before or after it.
-func atTokenBoundary(text string, start, end int) bool {
+func isHostRune(r rune) bool { return isAlnumRune(r) || r == '-' }
+
+func isLocalPartRune(r rune) bool { return isAlnumRune(r) || strings.ContainsRune("._%+-", r) }
+
+// atBoundary reports whether text[start:end] is free of the neighbours mode
+// forbids. The text edge is always a boundary.
+func atBoundary(text string, start, end int, mode boundMode) bool {
+	left, right := isAlnumRune, isAlnumRune
+	switch mode {
+	case boundNone:
+		return true
+	case boundHost:
+		left, right = isHostRune, isHostRune
+	case boundEmail:
+		left, right = isLocalPartRune, isHostRune
+	}
 	if start > 0 {
-		if r, _ := utf8.DecodeLastRuneInString(text[:start]); isAlnumRune(r) {
+		if r, _ := utf8.DecodeLastRuneInString(text[:start]); left(r) {
 			return false
 		}
 	}
 	if end < len(text) {
-		if r, _ := utf8.DecodeRuneInString(text[end:]); isAlnumRune(r) {
+		if r, _ := utf8.DecodeRuneInString(text[end:]); right(r) {
 			return false
 		}
 	}
@@ -163,7 +192,7 @@ func (a *Automaton) findAll(text string, accept func(Kind) bool) []Match {
 			if p.caseSensitive && text[sp.s:sp.e] != p.text {
 				continue
 			}
-			if p.boundary && !atTokenBoundary(text, sp.s, sp.e) {
+			if !atBoundary(text, sp.s, sp.e, p.bound) {
 				continue
 			}
 			// Prefer an exact (case-sensitive) pattern over a folded one.

@@ -175,13 +175,22 @@ const maxUserinfoLookback = 512
 // inURLUserinfo reports whether position i is inside the authority of a URL
 // (scheme://user:pass@host): the '@' there ends credentials, not an email
 // address. Those are userinfoSecrets' spans.
+//
+// The look-back stops at whitespace, quotes and list or markup delimiters
+// (",;|()[]{}<>"), so "https://acme.pt,joao@gmail.com" and
+// "[docs](https://acme.pt),joao@gmail.com" keep their email. Only a bare
+// authority (no '/', '?', '#' or '@') may sit between "://" and the email.
 func inURLUserinfo(text string, i int) bool {
 	lo := max(0, i-maxUserinfoLookback)
-	ls := lo + strings.LastIndexAny(text[lo:i], " \t\r\n\"'<>") + 1
+	ls := lo + strings.LastIndexAny(text[lo:i], userinfoStops) + 1
 	prefix := text[ls:i]
-	j := strings.Index(prefix, "://")
-	return j >= 0 && !strings.ContainsAny(prefix[j+3:], "/?#")
+	j := strings.LastIndex(prefix, "://")
+	return j > 0 && !strings.ContainsAny(prefix[j+3:], "/?#@")
 }
+
+// userinfoStops are bytes that cannot occur in a URL authority as written in
+// prose; userinfoRE excludes the same set.
+const userinfoStops = " \t\r\n\"'<>,;|()[]{}"
 
 // ipv4s reports public dotted quads. Like middlehack's IPV4_RE, a quad that
 // is part of a longer dotted number (1.2.3.4.5) is ignored; a trailing

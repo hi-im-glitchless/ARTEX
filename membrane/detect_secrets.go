@@ -149,7 +149,12 @@ func valueSpan(text string, s, e int, k Kind) (Span, bool) {
 
 // Known secret formats (cockpit _SECRET_RES plus common vendor prefixes).
 var (
-	pemRE = regexp.MustCompile(`(?s)-----BEGIN ((?:[A-Z0-9]+ )*)PRIVATE KEY-----.*?-----END ((?:[A-Z0-9]+ )*)PRIVATE KEY-----`)
+	// PEM / PGP armour: "PRIVATE KEY" or "PRIVATE KEY BLOCK" (PGP).
+	pemBeginRE = regexp.MustCompile(`-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----`)
+	pemEndRE   = regexp.MustCompile(`-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----`)
+	// pemBodyLineRE: lines a (possibly truncated) armour body consists of —
+	// base64 (incl. the PGP "=crc" line) or "Header: value" lines.
+	pemBodyLineRE = regexp.MustCompile(`^(?:[A-Za-z0-9+/=]+|[A-Za-z][A-Za-z0-9-]*: .*)$`)
 	// tokenFormats: each regexp runs only when its anchor occurs; a leading
 	// literal lets regexp skip ahead with a substring search. wordStart
 	// requires no word byte before the match (a \b written in code).
@@ -170,16 +175,84 @@ var (
 	bearerRE = regexp.MustCompile(`(?i)\b(?:(?:bearer|token|api[_-]?key)\s*[:=]\s*['"]?|bearer\s+)([A-Za-z0-9._~+/-]{16,}=*)`)
 	// secretKVRE: cockpit _SECRET_KV_RE for "key: value" in free text; the
 	// "key=value" form is kvSecrets' (it also decodes URL encoding).
-	secretKVRE = regexp.MustCompile(`(?i)\b(secret|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|password|passwd|pwd|private[_-]?key)\s*:\s*['"]?([A-Za-z0-9._\-/+!@#$^&*]{4,})`)
+	// A quoted value is the whole inner string (spaces allowed).
+	secretKVRE = regexp.MustCompile(`(?i)\b(secret|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|password|passwd|pwd|private[_-]?key)\s*:\s*` + quotedOr(`[A-Za-z0-9._\-/+!@#$^&*]{4,}`))
 )
+
+// quotedOr returns a regexp fragment with three value groups: a "double"
+// quoted inner string, a 'single' quoted one, or bare.
+func quotedOr(bare string) string {
+	return `(?:"([^"\n]*)"|'([^'\n]*)'|(` + bare + `))`
+}
+
+// valueGroup returns the indices of the first matched group among the
+// three quotedOr groups starting at group g.
+func valueGroup(m []int, g int) (int, int) {
+	for i := g; i < g+3; i++ {
+		if m[2*i] >= 0 {
+			return m[2*i], m[2*i+1]
+		}
+	}
+	return -1, -1
+}
+
+// pemBlocks reports private key armour. A block without its END line (tool
+// output is truncated) runs to the end of its armour body.
+func pemBlocks(text string, out []Span) []Span {
+	for pos := 0; pos < len(text); {
+		b := pemBeginRE.FindStringIndex(text[pos:])
+		if b == nil {
+			break
+		}
+		s, e := pos+b[0], pos+b[1]
+		if end := pemEndRE.FindStringIndex(text[e:]); end != nil {
+			e += end[1]
+		} else {
+			e = pemBodyEnd(text, e)
+		}
+		out = append(out, rawSpan(text, s, e, KindPrivateKey))
+		pos = e
+	}
+	return out
+}
+
+// pemBodyEnd returns the end of the last non-empty armour body line after
+// position e (the end of the BEGIN line).
+func pemBodyEnd(text string, e int) int {
+	i := e
+	switch {
+	case strings.HasPrefix(text[i:], "\r\n"):
+		i += 2
+	case strings.HasPrefix(text[i:], "\n"):
+		i++
+	default:
+		return e // body not on following lines (e.g. JSON-escaped; see views)
+	}
+	last := e
+	for i < len(text) {
+		j := strings.IndexByte(text[i:], '\n')
+		if j < 0 {
+			j = len(text)
+		} else {
+			j += i
+		}
+		line := strings.TrimSuffix(text[i:j], "\r")
+		if line != "" {
+			if !pemBodyLineRE.MatchString(line) {
+				break
+			}
+			last = i + len(line)
+		}
+		i = j + 1
+	}
+	return last
+}
 
 // secretFormats finds known token formats and keyword-introduced secrets.
 // low is text lowercased (ASCII), used for case-insensitive anchors.
 func secretFormats(text, low string, out []Span) []Span {
 	if strings.Contains(text, "-----BEGIN ") {
-		for _, m := range pemRE.FindAllStringIndex(text, -1) {
-			out = append(out, rawSpan(text, m[0], m[1], KindPrivateKey))
-		}
+		out = pemBlocks(text, out)
 	}
 	for _, f := range tokenFormats {
 		if !strings.Contains(text, f.anchor) {
@@ -203,7 +276,8 @@ func secretFormats(text, low string, out []Span) []Span {
 		if passwordKeyRE.MatchString(text[m[2]:m[3]]) {
 			k = KindPassword
 		}
-		if sp, ok := valueSpan(text, m[4], m[5], k); ok {
+		vs, ve := valueGroup(m, 2)
+		if sp, ok := valueSpan(text, vs, ve, k); ok {
 			out = append(out, sp)
 		}
 	}
@@ -271,6 +345,16 @@ func headerSecrets(text string, out []Span) []Span {
 			if !ok {
 				continue
 			}
+			// A quoted value (YAML "password: 'a b'") is the whole inner
+			// string, quotes excluded.
+			if q := text[vs]; q == '"' || q == '\'' {
+				if c := strings.IndexByte(text[vs+1:ve], q); c >= 0 {
+					if sp, ok := valueSpan(text, vs+1, vs+1+c, k); ok {
+						out = append(out, sp)
+					}
+					continue
+				}
+			}
 			if k == KindToken {
 				out = authValue(text, vs, ve, out)
 				continue
@@ -280,8 +364,7 @@ func headerSecrets(text string, out []Span) []Span {
 			for e < ve && text[e] != ' ' && text[e] != '\t' {
 				e++
 			}
-			s, e := trimQuotes(text, vs, e)
-			if sp, ok := valueSpan(text, s, e, k); ok {
+			if sp, ok := valueSpan(text, vs, e, k); ok {
 				out = append(out, sp)
 			}
 		}
@@ -398,8 +481,11 @@ func jsonKeySecrets(text string, out []Span) []Span {
 	return out
 }
 
-// kvRE matches query, form and env style key=value pairs.
-var kvRE = regexp.MustCompile(`(?:^|[?&;\s,(])([A-Za-z_][A-Za-z0-9_.\-\[\]]{0,40})=([^&\s;,"'<>#)]+)`)
+// kvRE matches query, form, env and assignment style key=value pairs,
+// including `KEY = "quoted value"`. A bare value never starts with '='
+// (comparisons such as "pass == x").
+var kvRE = regexp.MustCompile(`(?:^|[?&;\s,(])([A-Za-z_][A-Za-z0-9_.\-\[\]]{0,40})[ \t]*=[ \t]*` +
+	quotedOr(`[^&\s;,"'<>#)=][^&\s;,"'<>#)]*`))
 
 func kvSecrets(text string, out []Span) []Span {
 	for _, m := range lineMatches(kvRE, text, lineHas(text, "=")) {
@@ -407,7 +493,11 @@ func kvSecrets(text string, out []Span) []Span {
 		if !ok {
 			continue
 		}
-		vs, ve := m[4], m[5]
+		vs, ve := valueGroup(m, 2)
+		if vs != m[8] { // quoted: the inner string as written
+			out = quotedValue(text, vs, ve, k, out)
+			continue
+		}
 		raw := text[vs:ve]
 		if !strings.ContainsAny(raw, "%+") {
 			out = plainValue(text, vs, ve, k, out)
@@ -422,13 +512,30 @@ func kvSecrets(text string, out []Span) []Span {
 	return out
 }
 
-// userinfoRE matches scheme://user:pass@ in URLs.
-var userinfoRE = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://([^/\s:@'"<>]+):([^/\s@'"<>]+)@`)
+// quotedValue reports a quoted field value; a token value that carries an
+// auth scheme ("Bearer x") is split like a header.
+func quotedValue(text string, s, e int, k Kind, out []Span) []Span {
+	low := strings.ToLower(text[s:e])
+	if k == KindToken && (strings.HasPrefix(low, "bearer ") || strings.HasPrefix(low, "basic ")) {
+		return authValue(text, s, e, out)
+	}
+	if sp, ok := valueSpan(text, s, e, k); ok {
+		out = append(out, sp)
+	}
+	return out
+}
+
+// userinfoRE matches scheme://user[:pass]@ in URLs. The userinfo classes
+// exclude the delimiters inURLUserinfo stops at.
+var userinfoRE = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://([^/\s:@'"<>,;|()\[\]{}]+)(?::([^/\s@'"<>,;|()\[\]{}]+))?@`)
 
 func userinfoSecrets(text string, out []Span) []Span {
 	for _, m := range lineMatches(userinfoRE, text, lineHas(text, "://")) {
 		if sp, ok := valueSpan(text, m[2], m[3], KindUsername); ok {
 			out = append(out, sp)
+		}
+		if m[4] < 0 {
+			continue // username only (https://joao.silva@host)
 		}
 		if sp, ok := valueSpan(text, m[4], m[5], KindPassword); ok {
 			out = append(out, sp)
