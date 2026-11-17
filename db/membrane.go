@@ -388,7 +388,8 @@ func (d *DB) VerifyMembraneChain() (ok bool, firstBadID int64, err error) {
 }
 
 // PurgeMembraneCompany deletes entries referenced only by companyID (whose
-// tasks, if any, all belong to it) and removes companyID from the provenance
+// tasks, if any, are not owned by another company; hard-deleted tasks no
+// longer count) and removes companyID from the provenance
 // of the rest. Returns the number of deleted entries. The caller records the
 // audit event and enforces the references guard.
 func (d *DB) PurgeMembraneCompany(companyID int64) (int, error) {
@@ -401,8 +402,8 @@ func (d *DB) PurgeMembraneCompany(companyID int64) (int, error) {
 DELETE FROM membrane_entries e
 WHERE e.company_ids = ARRAY[$1]::bigint[]
   AND NOT EXISTS (
-      SELECT 1 FROM unnest(e.task_ids) t
-      WHERE NOT EXISTS (SELECT 1 FROM tasks WHERE id = t AND company_id = $1))`, companyID)
+      SELECT 1 FROM unnest(e.task_ids) t JOIN tasks k ON k.id = t
+      WHERE k.company_id IS NOT NULL AND k.company_id <> $1)`, companyID)
 	if err != nil {
 		return 0, err
 	}

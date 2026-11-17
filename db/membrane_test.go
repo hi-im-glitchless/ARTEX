@@ -180,15 +180,32 @@ func TestPurgeRules(t *testing.T) {
 		return e
 	}
 	only := ins("only", []int64{c1}, []int64{tk.ID})
-	foreignTask := ins("ftask", []int64{c1}, []int64{tk.ID + 1000000})
+	tk2, err := d.CreateTask("purge test other", "g", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.DeleteTask(tk2.ID) })
+	if _, err := d.Exec(`UPDATE tasks SET company_id=$1 WHERE id=$2`, c2, tk2.ID); err != nil {
+		t.Fatal(err)
+	}
+	foreignTask := ins("ftask", []int64{c1}, []int64{tk2.ID})
+	// A task hard-deleted before the purge (guard passed): entry must be purged.
+	gone, err := d.CreateTask("purge test gone", "g", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted := ins("deleted", []int64{c1}, []int64{gone.ID})
+	if err := d.DeleteTask(gone.ID); err != nil {
+		t.Fatal(err)
+	}
 	shared := ins("shared", []int64{c1, c2}, []int64{tk.ID})
 
 	n, err := d.PurgeMembraneCompany(c1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Fatalf("purged %d, want 1", n)
+	if n != 2 {
+		t.Fatalf("purged %d, want 2", n)
 	}
 	byID := map[int64]MembraneEntry{}
 	list, _ := d.ListMembraneEntries()
@@ -197,6 +214,9 @@ func TestPurgeRules(t *testing.T) {
 	}
 	if _, ok := byID[only.ID]; ok {
 		t.Fatal("exclusive entry must be deleted")
+	}
+	if _, ok := byID[deleted.ID]; ok {
+		t.Fatal("entry whose task was hard-deleted must be purged")
 	}
 	if e, ok := byID[foreignTask.ID]; !ok || len(e.CompanyIDs) != 0 {
 		t.Fatalf("entry with foreign task must survive with company removed: %+v", e)
