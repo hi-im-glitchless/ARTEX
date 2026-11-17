@@ -22,6 +22,8 @@ type fakePersistence struct {
 	entries []db.MembraneEntry
 	blocks  []db.MembraneBlock
 	inserts int
+	// failUpdates makes the next N UpdateMembraneEntryAlias calls fail.
+	failUpdates int
 }
 
 func (f *fakePersistence) InsertMembraneEntry(e *db.MembraneEntry) (db.MembraneEntry, error) {
@@ -54,6 +56,10 @@ func (f *fakePersistence) InsertMembraneEntry(e *db.MembraneEntry) (db.MembraneE
 func (f *fakePersistence) UpdateMembraneEntryAlias(id int64, newAlias string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failUpdates > 0 {
+		f.failUpdates--
+		return errors.New("injected update failure")
+	}
 	for i := range f.entries {
 		x := &f.entries[i]
 		if x.ID != id {
@@ -685,5 +691,64 @@ func TestDomainEnrolledAfterKeywordUsesIt(t *testing.T) {
 	root, _, _ := s.AliasFor("acme.pt")
 	if a != "login."+strings.ToLower(kw)+"-app."+root {
 		t.Fatalf("alias %q", a)
+	}
+}
+
+func TestRemintHealsAfterFailure(t *testing.T) {
+	for _, heal := range []string{"reopen", "re-enroll"} {
+		t.Run(heal, func(t *testing.T) {
+			s, p := newTestStore(t)
+			if _, err := s.Enroll(KindDomain, "acmebank-vpn.acmebank.pt", seedProv); err != nil {
+				t.Fatal(err)
+			}
+			p.failUpdates = 1
+			_, err := s.Enroll(KindOrg, "AcmeBank", seedProv)
+			if err == nil {
+				t.Fatal("injected re-mint failure not reported")
+			}
+			if strings.Contains(strings.ToLower(err.Error()), "acmebank") {
+				t.Fatalf("error leaks original: %v", err)
+			}
+			old, _, _ := s.AliasFor("acmebank-vpn.acmebank.pt")
+			if !strings.Contains(old, "acmebank") {
+				t.Fatalf("precondition: re-mint should have failed, alias %q", old)
+			}
+			var cur *Store
+			switch heal {
+			case "reopen":
+				cur, err = OpenStore(p, testEncKey, testHMACKey)
+			case "re-enroll":
+				cur = s
+				_, err = s.Enroll(KindOrg, "acmebank", seedProv)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if a, _, _ := cur.AliasFor("acmebank-vpn.acmebank.pt"); strings.Contains(a, "acmebank") {
+				t.Fatalf("not healed: alias %q", a)
+			}
+			if o, _, ok := cur.OriginalFor(old); !ok || o != "acmebank-vpn.acmebank.pt" {
+				t.Fatalf("old alias no longer resolves: %q %v", o, ok)
+			}
+		})
+	}
+}
+
+func TestOpenStoreFailsClosedOnSweepError(t *testing.T) {
+	s, p := newTestStore(t)
+	if _, err := s.Enroll(KindDomain, "acmebank-vpn.acmebank.pt", seedProv); err != nil {
+		t.Fatal(err)
+	}
+	p.failUpdates = 1
+	if _, err := s.Enroll(KindOrg, "AcmeBank", seedProv); err == nil {
+		t.Fatal("expected failure")
+	}
+	p.failUpdates = 1
+	_, err := OpenStore(p, testEncKey, testHMACKey)
+	if err == nil {
+		t.Fatal("OpenStore must fail when the re-mint sweep fails")
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "acmebank") {
+		t.Fatalf("error leaks original: %v", err)
 	}
 }

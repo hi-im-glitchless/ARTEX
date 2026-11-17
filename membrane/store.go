@@ -141,7 +141,35 @@ func OpenStore(p Persistence, encKey, hmacKey []byte) (*Store, error) {
 	if err := s.reload(); err != nil {
 		return nil, err
 	}
+	// Heal any re-mint that failed part-way earlier (ruling R9). Failing here
+	// fails closed: a store that would emit a keyword in clear is not opened.
+	if err := s.remintAllKeywords(); err != nil {
+		return nil, fmt.Errorf("membrane store: re-mint sweep: %w", err)
+	}
 	return s, nil
+}
+
+// remintAllKeywords runs remintForKeyword for every enrolled keyword.
+func (s *Store) remintAllKeywords() error {
+	s.mu.RLock()
+	seen := map[string]bool{}
+	var kws []string
+	for _, e := range s.byKey {
+		if isKeywordKind(e.kind) && !seen[e.norm] {
+			seen[e.norm] = true
+			kws = append(kws, e.norm)
+		}
+	}
+	s.mu.RUnlock()
+	sort.Strings(kws)
+	s.enrollMu.Lock()
+	defer s.enrollMu.Unlock()
+	for _, k := range kws {
+		if err := s.remintForKeyword(k); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func hmacSum(key []byte, msg string) []byte {
@@ -374,6 +402,12 @@ func (s *Store) enrollLocked(kind Kind, original string, prov Provenance) (strin
 	if e != nil {
 		if err := s.mergeProvenance(e, prov); err != nil {
 			return "", err
+		}
+		if isKeywordKind(kind) {
+			// Idempotent: heals a re-mint that failed on an earlier call.
+			if err := s.remintForKeyword(norm); err != nil {
+				return "", err
+			}
 		}
 		return e.alias, nil
 	}
