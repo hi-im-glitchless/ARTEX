@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
 	"golang.org/x/net/idna"
@@ -50,6 +51,10 @@ const (
 // minLiteralLen and literalStoplist keep ambiguous originals out of the
 // dictionary automaton (ruling R3). They stay in the store for exact lookup.
 const minLiteralLen = 3
+
+// shortKeywordMax is the longest keyword (in runes) that only matches at
+// token boundaries; longer keywords also match inside compounds (ruling R10).
+const shortKeywordMax = 4
 
 var literalStoplist = map[string]bool{
 	"admin": true, "root": true, "test": true, "user": true, "guest": true,
@@ -659,7 +664,8 @@ func (s *Store) mintDomain(norm string, attempt int, prov Provenance) (string, e
 }
 
 // replaceKeywords swaps enrolled org/product/person keywords inside a DNS
-// label for their lowercase alias.
+// label for their lowercase alias. Keywords of 3-4 runes are replaced only
+// as whole tokens (ruling R10): "billing" keeps its "ing".
 func replaceKeywords(dict *Automaton, label string) string {
 	ms := dict.findAll(label, isKeywordKind)
 	if len(ms) == 0 {
@@ -778,7 +784,8 @@ func (s *Store) IsModelKnown(domain string) bool {
 // Dictionary returns an immutable automaton snapshot over the enrolled
 // originals, rebuilt lazily after enrolment. IP addresses are left to the
 // structural detectors; originals shorter than 3 bytes or on the ambiguous
-// word stoplist are left out (they remain available to AliasFor).
+// word stoplist are left out (they remain available to AliasFor). Keywords of
+// 3-4 runes match only at token boundaries (ruling R10).
 func (s *Store) Dictionary() *Automaton {
 	s.mu.RLock()
 	if !s.dictDirty {
@@ -808,7 +815,8 @@ func (s *Store) patternsLocked() []acPattern {
 			return
 		}
 		pats = append(pats, acPattern{text: text, original: e.original, kind: e.kind,
-			alias: e.alias, caseSensitive: !foldKind(e.kind)})
+			alias: e.alias, caseSensitive: !foldKind(e.kind),
+			boundary: isKeywordKind(e.kind) && utf8.RuneCountInString(text) <= shortKeywordMax})
 	}
 	for _, k := range keys {
 		e := s.byKey[k]

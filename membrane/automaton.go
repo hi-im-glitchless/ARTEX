@@ -1,6 +1,10 @@
 package membrane
 
-import "sort"
+import (
+	"sort"
+	"unicode"
+	"unicode/utf8"
+)
 
 // Match is one dictionary hit in a scanned text: text[Start:End] (byte
 // offsets) is an occurrence of the enrolled Original, or of a variant of it
@@ -26,6 +30,28 @@ type acPattern struct {
 	kind          Kind
 	alias         string
 	caseSensitive bool
+	// boundary requires a token boundary (text edge or a non-alphanumeric
+	// rune) on both sides of the match (ruling R10: short keywords).
+	boundary bool
+}
+
+// isAlnumRune reports whether r is a letter or digit (any script).
+func isAlnumRune(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+
+// atTokenBoundary reports whether text[start:end] has no letter or digit
+// directly before or after it.
+func atTokenBoundary(text string, start, end int) bool {
+	if start > 0 {
+		if r, _ := utf8.DecodeLastRuneInString(text[:start]); isAlnumRune(r) {
+			return false
+		}
+	}
+	if end < len(text) {
+		if r, _ := utf8.DecodeRuneInString(text[end:]); isAlnumRune(r) {
+			return false
+		}
+	}
+	return true
 }
 
 type acNode struct {
@@ -102,8 +128,9 @@ func (a *Automaton) Len() int {
 
 // FindAll returns the leftmost-longest, non-overlapping dictionary matches in
 // text, ordered by Start. Domains and keywords match case-insensitively
-// (ASCII); secrets and credentials match exactly. A nil Automaton matches
-// nothing.
+// (ASCII); secrets and credentials match exactly. Keywords of 3-4 runes match
+// only at token boundaries, longer ones also inside compounds (ruling R10).
+// A nil Automaton matches nothing.
 func (a *Automaton) FindAll(text string) []Match { return a.findAll(text, nil) }
 
 // findAll is FindAll restricted to patterns whose kind accept allows.
@@ -134,6 +161,9 @@ func (a *Automaton) findAll(text string, accept func(Kind) bool) []Match {
 			}
 			sp := span{i + 1 - len(p.text), i + 1}
 			if p.caseSensitive && text[sp.s:sp.e] != p.text {
+				continue
+			}
+			if p.boundary && !atTokenBoundary(text, sp.s, sp.e) {
 				continue
 			}
 			// Prefer an exact (case-sensitive) pattern over a folded one.

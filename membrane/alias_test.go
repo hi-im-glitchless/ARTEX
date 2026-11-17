@@ -62,22 +62,6 @@ func TestFormatPreserving(t *testing.T) {
 	}
 }
 
-func luhnValid(s string) bool {
-	sum, alt := 0, false
-	for i := len(s) - 1; i >= 0; i-- {
-		v := int(s[i] - '0')
-		if alt {
-			v *= 2
-			if v > 9 {
-				v -= 9
-			}
-		}
-		sum += v
-		alt = !alt
-	}
-	return sum%10 == 0
-}
-
 func TestFormatPreservingCardLuhn(t *testing.T) {
 	d := testDeriver()
 	for _, in := range []string{"4111111111111111", "5500005555555559", "378282246310005"} {
