@@ -2007,6 +2007,9 @@ func (s *Server) taskScopeAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	// A seed failure is logged; the task's next request fails closed on
+	// its own sync.
+	_ = s.membraneSeedChanged(r.Context(), nil, taskID)
 	writeJSON(w, 200, ts)
 }
 

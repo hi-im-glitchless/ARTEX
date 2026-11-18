@@ -55,6 +55,72 @@ func (s *Server) SyncTask(ctx context.Context, taskID string) ([]int64, error) {
 	return s.membraneSyncTaskID(ctx, id)
 }
 
+// SyncEpoch implements membrane.SyncEpocher.
+func (s *Server) SyncEpoch() uint64 { return s.mem.seedEpoch.Load() }
+
+// SyncGlobal implements membrane.GlobalSyncer: before a request without a
+// task id (chat, custom agents) it seeds every company, so a company
+// declared after startup is aliased in conversations too (spec §7.1).
+func (s *Server) SyncGlobal(ctx context.Context) error {
+	sd := s.seeder()
+	if sd == nil {
+		return nil
+	}
+	companies, err := s.m.pg.Companies().ListCompanies()
+	if err != nil {
+		return fmt.Errorf("membrane seed: list companies: %w", err)
+	}
+	for _, c := range companies {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := sd.company(c.ID); err != nil {
+			return fmt.Errorf("membrane seed: company %d: %w", c.ID, err)
+		}
+	}
+	return nil
+}
+
+// membraneSeedChanged is called after a seed source changed (spec §7.1:
+// seeding happens whenever scope, credentials or companies change): it
+// expires every throttled sync, then seeds the changed companies and task
+// synchronously so the next request already sees them. The error (step
+// names and ids only) is logged and returned for the response; requests
+// still fail closed on their own sync.
+func (s *Server) membraneSeedChanged(ctx context.Context, companyIDs []int64, taskID int64) error {
+	s.mem.seedEpoch.Add(1)
+	sd := s.seeder()
+	if sd == nil {
+		return nil
+	}
+	var errs []error
+	for _, cid := range companyIDs {
+		if cid <= 0 {
+			continue
+		}
+		if err := sd.company(cid); err != nil {
+			errs = append(errs, fmt.Errorf("membrane seed: company %d: %w", cid, err))
+		}
+	}
+	if taskID > 0 {
+		if _, err := s.membraneSyncTaskID(ctx, taskID); err != nil {
+			errs = append(errs, fmt.Errorf("membrane seed: task %d: %w", taskID, err))
+		}
+	}
+	err := errors.Join(errs...)
+	if err != nil {
+		log.Printf("[membrane] seed after change: %v", err)
+	}
+	return err
+}
+
+// membraneSeedResult adds the seed error, if any, to a JSON response.
+func membraneSeedResult(out map[string]any, err error) {
+	if err != nil {
+		out["membrane_seed_error"] = err.Error()
+	}
+}
+
 // membraneSyncTask seeds t before it launches (launchTask).
 func (s *Server) membraneSyncTask(t *Task) error {
 	if t == nil {

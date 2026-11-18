@@ -37,6 +37,10 @@ type membraneState struct {
 	err        string
 	// seedErr is written by membraneSyncAll after startup, hence atomic.
 	seedErr atomic.Pointer[string]
+	// seedEpoch changes whenever a seed source changes (company, company
+	// scope, task scope, task credentials): it expires the providers'
+	// throttled syncs (membrane.SyncEpocher).
+	seedEpoch atomic.Uint64
 }
 
 // initMembrane opens the membrane store with keys from the environment or

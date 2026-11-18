@@ -62,6 +62,22 @@ type Syncer interface {
 	SyncTask(ctx context.Context, taskID string) (companyIDs []int64, err error)
 }
 
+// GlobalSyncer is optionally implemented by a Syncer: it seeds the values
+// that belong to no task (companies, spec §7.1) before a request without a
+// numeric task id (chat conversations, custom agents), at most once per
+// syncInterval after a success; a failure blocks the request. Errors must
+// not contain originals.
+type GlobalSyncer interface {
+	SyncGlobal(ctx context.Context) error
+}
+
+// SyncEpocher is optionally implemented by a Syncer: the epoch changes
+// whenever a seed source changes (a company, its scope, a task's scope or
+// credentials), which expires every throttled sync at once.
+type SyncEpocher interface {
+	SyncEpoch() uint64
+}
+
 // WithSyncer makes the decorator sync each task's seeds before its requests.
 func WithSyncer(s Syncer) Option {
 	return func(w *wrapped) { w.syncer = s }
@@ -76,8 +92,12 @@ const maxSyncCache = 1024
 
 type syncState struct {
 	at        time.Time
+	epoch     uint64
 	companies []int64
 }
+
+// globalSyncKey is the sync cache key of task-less requests.
+const globalSyncKey = ""
 
 // engineAPI is the part of *Engine the decorator uses; tests substitute a
 // faulty engine to prove the leak check blocks.
@@ -172,24 +192,39 @@ func roleFromSession(id string) string {
 }
 
 // syncTask runs the syncer for a numeric task id (throttled per task after
-// a success) and returns the task's company ids. Requests without a task id
-// (chat conversations, connection tests) are not synced: they rely on the
-// startup sync and structural detection.
+// a success, until the syncer's epoch changes) and returns the task's
+// company ids. A request without a task id (chat conversations, custom
+// agents, connection tests) runs the GlobalSyncer instead, when the syncer
+// has one, throttled the same way.
 func (w *wrapped) syncTask(ctx context.Context, taskID string) ([]int64, error) {
 	if w.syncer == nil {
 		return nil, nil
 	}
+	gs, _ := w.syncer.(GlobalSyncer)
 	if id, err := strconv.ParseInt(taskID, 10, 64); err != nil || id <= 0 {
-		return nil, nil
+		if gs == nil {
+			return nil, nil
+		}
+		taskID = globalSyncKey
+	}
+	var epoch uint64
+	if ep, ok := w.syncer.(SyncEpocher); ok {
+		epoch = ep.SyncEpoch()
 	}
 	now := w.now()
 	w.syncMu.Lock()
 	st, ok := w.synced[taskID]
 	w.syncMu.Unlock()
-	if ok && now.Sub(st.at) < syncInterval {
+	if ok && now.Sub(st.at) < syncInterval && st.epoch == epoch {
 		return slices.Clone(st.companies), nil
 	}
-	companies, err := w.syncer.SyncTask(ctx, taskID)
+	var companies []int64
+	var err error
+	if taskID == globalSyncKey {
+		err = gs.SyncGlobal(ctx)
+	} else {
+		companies, err = w.syncer.SyncTask(ctx, taskID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +237,7 @@ func (w *wrapped) syncTask(ctx context.Context, taskID string) ([]int64, error) 
 			}
 		}
 	}
-	w.synced[taskID] = syncState{at: now, companies: companies}
+	w.synced[taskID] = syncState{at: now, epoch: epoch, companies: companies}
 	w.syncMu.Unlock()
 	return companies, nil
 }

@@ -352,6 +352,9 @@ func (s *Server) syncSSRun(w http.ResponseWriter, r *http.Request) {
 	// (scope was written above; assets came after).
 	if madeCompany {
 		_ = cs.RecomputeAttribution()
+		// New companies and scope: expire throttled membrane syncs so the
+		// next request of every task and conversation seeds them.
+		_ = s.membraneSeedChanged(ctx, nil, 0)
 	}
 
 	writeJSON(w, 200, map[string]any{
