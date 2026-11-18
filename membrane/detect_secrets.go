@@ -641,7 +641,7 @@ func shapedValue(v string) bool {
 // too short (min length 3) or shaped.
 func valueSpan(text string, s, e int, k Kind) (Span, bool) {
 	v := text[s:e]
-	if utf8.RuneCountInString(v) < minLiteralLen || shapedValue(v) || placeholderValue(v) {
+	if utf8.RuneCountInString(v) < minLiteralLen || shapedValue(v) || placeholderValue(v) || referenceValue(v) {
 		return Span{}, false
 	}
 	return Span{Start: s, End: e, Kind: k, Value: v}, true
@@ -667,6 +667,24 @@ var placeholderWords = map[string]bool{
 	"enabled": true, "disabled": true, "required": true, "optional": true,
 	// Service accounts: not client-identifying (--user=www-data).
 	"www-data": true, "nobody": true, "daemon": true, "nginx": true, "apache": true,
+}
+
+// referenceValue reports a value that refers to a secret held elsewhere
+// rather than being one: a shell command substitution ($(cmd ...), `cmd`),
+// a parameter expansion (${NAME...}) or a $NAME variable whose name is in
+// one case (PASS, DB_PASSWORD, token). The value as detected may be cut at
+// the first blank ("$(cat"), so only its start is examined. A mixed-case
+// $Name ($uperS3cret) is taken for a password that starts with '$'.
+func referenceValue(v string) bool {
+	t := strings.TrimSpace(v)
+	if strings.HasPrefix(t, "$(") || strings.HasPrefix(t, "${") || strings.HasPrefix(t, "`") {
+		return true
+	}
+	if !envVarRE.MatchString(t) {
+		return false
+	}
+	name := t[1:]
+	return name == strings.ToUpper(name) || name == strings.ToLower(name)
 }
 
 // placeholderValue reports a value that is a template or placeholder, not a
@@ -1029,7 +1047,7 @@ func jsonKeySecrets(text string, out []Span) []Span {
 		if json.Unmarshal([]byte(`"`+raw+`"`), &dec) != nil {
 			continue
 		}
-		if utf8.RuneCountInString(dec) < minLiteralLen || shapedValue(dec) {
+		if utf8.RuneCountInString(dec) < minLiteralLen || shapedValue(dec) || referenceValue(dec) {
 			continue
 		}
 		out = append(out, Span{Start: vs, End: ve, Kind: k, Value: dec, Encoding: EncJSONEscape})
@@ -1139,7 +1157,7 @@ func kvSecrets(text string, out []Span) []Span {
 			out = plainValue(text, vs, ve, k, out)
 			continue
 		}
-		if utf8.RuneCountInString(dec) < minLiteralLen || shapedValue(dec) || placeholderValue(dec) {
+		if utf8.RuneCountInString(dec) < minLiteralLen || shapedValue(dec) || placeholderValue(dec) || referenceValue(dec) {
 			continue
 		}
 		out = append(out, Span{Start: vs, End: ve, Kind: k, Value: dec, Encoding: EncURL})

@@ -42,5 +42,5 @@
   "basic_credentials": [["jsilva", "Hunter2024!"], ["mferreira", "Lisboa#2025"]],
   "not_enrolled": ["string", "ffffff.example", "240.9.9.9", "c7q2x9.callback-oast.net", "okta.com", "acme.okta.com"],
   "not_roots": ["okta.com", "callback-oast.net"],
-  "pass_through": ["c7q2x9.callback-oast.net", "acme.okta.com", "login.okta.com", "10.0.0.5"]
+  "pass_through": ["export JWT=$(cat /run/secrets/jwt)", "DB_PASSWORD=$DB_PASS", "c7q2x9.callback-oast.net", "acme.okta.com", "login.okta.com", "10.0.0.5"]
 }

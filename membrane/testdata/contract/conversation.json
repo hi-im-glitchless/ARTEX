@@ -118,7 +118,7 @@
           "tool": "bash",
           "input": {"command": "curl -s https://{{a:portal.acmebank.pt}}/admin/settings"},
           "expect": {"command": "curl -s https://portal.acmebank.pt/admin/settings"},
-          "result": "<form>\n<input type=\"text\" name=\"smtp_password\" value=\"Mail#Relay77\">\n<input value=\"Xq9!vLm2\" name=\"pwd\" type=\"password\">\n</form>\n<script>var cfg = {\"password\":83920174,\"pin\":482913};</script>\n# deploy.yml\npassphrase: correct horse battery staple\n"
+          "result": "<form>\n<input type=\"text\" name=\"smtp_password\" value=\"Mail#Relay77\">\n<input value=\"Xq9!vLm2\" name=\"pwd\" type=\"password\">\n</form>\n<script>var cfg = {\"password\":83920174,\"pin\":482913};</script>\n# deploy.yml\npassphrase: correct horse battery staple\n# entrypoint.sh\nexport JWT=$(cat /run/secrets/jwt)\nDB_PASSWORD=$DB_PASS\n"
         }
       ]
     },

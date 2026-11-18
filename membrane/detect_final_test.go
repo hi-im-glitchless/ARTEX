@@ -67,3 +67,38 @@ func TestPassphraseWholeLine(t *testing.T) {
 		t.Errorf("free-form password note rewritten: %q", out)
 	}
 }
+
+// Final review I6: command substitutions and variable references after a
+// secret-named variable, option or header are references, not secrets.
+func TestShellReferencesAreNotSecrets(t *testing.T) {
+	e, _ := newTestEngine(t)
+	for _, in := range []string{
+		"TOKEN=$(curl -s -X POST https://example.org/login -d @creds.json | jq -r .token)",
+		"export JWT=$(cat /tmp/jwt.txt)",
+		"KEY=$(id -u)",
+		"PASSWORD=$PASS",
+		"PASSWORD=${DB_PASS:-x}",
+		"API_KEY=`cat key.txt`",
+		"secret: $(whoami)",
+		"password: $DB_PASSWORD",
+		`{"password":"$(cat /run/secrets/pw)"}`,
+		"curl --token $API_TOKEN https://example.org",
+		"app --password=$(pass show db) status",
+		"mysql -h db -p$(cat /root/pw) -e 'select 1'",
+		"mysql -h db -p$MYSQL_PWD",
+		"Authorization: Bearer $TOKEN",
+		"password = \"$(vault read -field=pw x)\"",
+	} {
+		out, _, err := e.ToModel(in, Provenance{TaskIDs: []int64{4}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != in {
+			t.Errorf("reference rewritten:\n in  %q\n out %q", in, out)
+		}
+	}
+	// A real secret that merely starts with '$' (mixed case) is still one.
+	assertNoClear(t, e, "PASSWORD=$uperS3cret", "$uperS3cret")
+	// The host inside a substitution is still aliased by its own detector.
+	assertNoClear(t, e, "TOKEN=$(curl -s https://portal.acmebank.pt/login)", "portal.acmebank.pt")
+}
