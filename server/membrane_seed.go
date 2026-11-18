@@ -66,15 +66,13 @@ func (s *Server) membraneSyncTask(t *Task) error {
 
 // membraneSyncAll seeds every company and every live task at startup.
 // Errors are logged and reported in membraneStatus; they are not fatal
-// because each task syncs again before its requests.
-func (s *Server) membraneSyncAll() error {
+// because each task syncs again before its requests. It stops when ctx is
+// done. ctx is passed in (not read from s.ctx, which New rewrites while this
+// runs in the background).
+func (s *Server) membraneSyncAll(ctx context.Context) error {
 	sd := s.seeder()
 	if sd == nil {
 		return nil
-	}
-	ctx := s.ctx
-	if ctx == nil {
-		ctx = context.Background()
 	}
 	var errs []error
 	companies, err := s.m.pg.Companies().ListCompanies()
@@ -179,7 +177,11 @@ func (s *Server) membraneSyncTaskID(ctx context.Context, id int64) ([]int64, err
 		var err error
 		switch r.Kind {
 		case "root_domain", "subdomain":
-			err = sd.host(r.Domain, prov)
+			mode := hostDeclared
+			if r.Source == "auto" {
+				mode = hostAuto
+			}
+			err = sd.classifiedHost(r.Domain, prov, mode)
 		case "ip", "cidr":
 			err = sd.network(r.Net, prov)
 		}
@@ -215,6 +217,10 @@ type seeder struct {
 	// seen dedupes tenant labels within one sync (each Enroll of an
 	// existing keyword costs a re-mint scan).
 	seen map[string]bool
+	// opKeywords are the operator keywords seen in this sync (company
+	// names, scope keyword/icp rows, declared roots' brand variants): the
+	// only keywords that can make a root client space.
+	opKeywords []string
 }
 
 // seeder returns nil when the membrane is off or not initialised: nothing to
@@ -303,7 +309,7 @@ SELECT v FROM (
 			return err
 		}
 		for _, v := range vals {
-			if err := sd.classifiedHost(v, prov, true); err != nil {
+			if err := sd.classifiedHost(v, prov, hostAsset); err != nil {
 				return err
 			}
 		}
@@ -323,7 +329,9 @@ func (sd *seeder) keyword(v string, prov membrane.Provenance) error {
 	if v == "" {
 		return nil
 	}
-	return sd.keywords(prov, append([]string{v}, membrane.BrandVariants(v)...)...)
+	vs := append([]string{v}, membrane.BrandVariants(v)...)
+	sd.opKeywords = append(sd.opKeywords, vs...)
+	return sd.keywords(prov, vs...)
 }
 
 func (sd *seeder) keywords(prov membrane.Provenance, vs ...string) error {
@@ -337,24 +345,42 @@ func (sd *seeder) keywords(prov membrane.Provenance, vs ...string) error {
 
 // host enrols a host name or an IP address (see classifiedHost).
 func (sd *seeder) host(h string, prov membrane.Provenance) error {
-	return sd.classifiedHost(h, prov, false)
+	return sd.classifiedHost(h, prov, hostDeclared)
 }
+
+// hostMode says how far a host is trusted as client data.
+type hostMode int
+
+const (
+	// hostDeclared: operator-declared (company/task scope added by a person
+	// or the agent's add_task_scope, credentials, the task target): a
+	// third-party host contributes its tenant label.
+	hostDeclared hostMode = iota
+	// hostAuto: recorded automatically (auto task_scope rows): a
+	// third-party host is left alone.
+	hostAuto
+	// hostAsset: an asset host: like hostAuto, and under a client root only
+	// the root is enrolled (subdomains alias through it).
+	hostAsset
+)
 
 // classifiedHost enrols an IP address, or classifies a host name by its
 // registrable root (Task 9 fix C1):
-//   - client root: already enrolled, or its label carries an enrolled client
+//   - client root: already enrolled, or its label carries an operator
 //     keyword (then opted in with EnrollRoot) -> the host is enrolled as a
-//     domain (rootOnly: just the root);
+//     domain (hostAsset: just the root);
 //   - otherwise third party (okta.com under acme.okta.com): no domain or root
 //     is ever enrolled for it, so derivation can never map a model's host
-//     onto another tenant; the host's tenant label, if distinctive, is
-//     enrolled as an org keyword so acme.okta.com reaches the model as
-//     org-xxxx.okta.com.
+//     onto another tenant. Only for an operator-declared host (hostDeclared)
+//     the tenant label, if distinctive, is enrolled as an org keyword so
+//     acme.okta.com reaches the model as org-xxxx.okta.com; auto-recorded
+//     hosts and assets (graph.microsoft.com, fonts.googleapis.com...) are
+//     left alone, since their labels are ordinary words (fix I-B).
 //
 // Values that are not a registrable host name (single labels such as
 // "localhost", a bare public suffix, URLs that do not parse) are skipped:
 // refusing the whole sync over one would block the task for good.
-func (sd *seeder) classifiedHost(h string, prov membrane.Provenance, rootOnly bool) error {
+func (sd *seeder) classifiedHost(h string, prov membrane.Provenance, mode hostMode) error {
 	h = hostOf(h)
 	if h == "" {
 		return nil
@@ -371,9 +397,12 @@ func (sd *seeder) classifiedHost(h string, prov membrane.Provenance, rootOnly bo
 		return err
 	}
 	if !client {
+		if mode != hostDeclared {
+			return nil
+		}
 		return sd.tenantLabel(h, root, prov)
 	}
-	if rootOnly {
+	if mode == hostAsset {
 		h = root
 	}
 	_, err = sd.st.Enroll(membrane.KindDomain, h, prov)
@@ -381,7 +410,8 @@ func (sd *seeder) classifiedHost(h string, prov membrane.Provenance, rootOnly bo
 }
 
 // clientRoot reports whether root is client space, opting in a root whose
-// label carries an enrolled client keyword (with its brand variant).
+// label carries an operator keyword (company names, scope keyword/icp rows
+// and their brand variants; never tenant labels) with its brand variant.
 func (sd *seeder) clientRoot(root string, prov membrane.Provenance) (bool, error) {
 	if membrane.IsSharedTenantRoot(root) {
 		return false, nil
@@ -390,7 +420,7 @@ func (sd *seeder) clientRoot(root string, prov membrane.Provenance) (bool, error
 		return true, nil
 	}
 	label, _, _ := strings.Cut(root, ".")
-	if !sd.st.LabelHasClientKeyword(label) {
+	if !membrane.LabelHasKeyword(label, sd.opKeywords) {
 		return false, nil
 	}
 	return true, sd.enrollRoot(root, prov)
@@ -439,7 +469,9 @@ func (sd *seeder) enrollRoot(root string, prov membrane.Provenance) error {
 		return err
 	}
 	// Brand inference only from client roots (Task 9 fix I1).
-	return sd.keywords(prov, membrane.BrandVariants(root)...)
+	vs := membrane.BrandVariants(root)
+	sd.opKeywords = append(sd.opKeywords, vs...)
+	return sd.keywords(prov, vs...)
 }
 
 // tenantLabel enrols the distinctive label of a third-party host nearest to

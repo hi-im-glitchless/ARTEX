@@ -63,14 +63,34 @@ func registrableLabel(name string) (string, bool) {
 	return label, true
 }
 
-// LabelHasClientKeyword reports whether label (a registrable domain's label,
-// e.g. "acmebank-online") contains an enrolled org or product keyword under
-// the dictionary's matching rules (R10 boundaries for short keywords). The
-// seeder treats such a root as client space.
-func (s *Store) LabelHasClientKeyword(label string) bool {
-	return len(s.Dictionary().findAll(label, func(k Kind) bool {
-		return k == KindOrg || k == KindProduct
-	})) > 0
+// LabelHasKeyword reports whether label (a registrable domain's label, e.g.
+// "acmebank-online") contains one of keywords under the dictionary's
+// matching rules (ruling R10): keywords of 5+ runes as substrings, shorter
+// ones (3-4 runes) only as whole tokens. Keywords with spaces never occur
+// in a label; shorter than 3 never match.
+func LabelHasKeyword(label string, keywords []string) bool {
+	label = strings.ToLower(label)
+	for _, k := range keywords {
+		k = strings.ToLower(strings.TrimSpace(k))
+		n := utf8.RuneCountInString(k)
+		if n < minLiteralLen || literalStoplist[k] || strings.ContainsFunc(k, unicode.IsSpace) {
+			continue
+		}
+		if n > shortKeywordMax {
+			if strings.Contains(label, k) {
+				return true
+			}
+			continue
+		}
+		for _, tok := range strings.FieldsFunc(label, func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+		}) {
+			if tok == k {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func keepVariants(vs ...string) []string {

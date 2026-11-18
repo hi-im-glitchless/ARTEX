@@ -157,7 +157,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// In the background: every task re-syncs before its requests anyway.
 	// Errors are logged and shown in membraneStatus.
 	if ctx.Err() == nil {
-		go func() { _ = s.membraneSyncAll() }()
+		go func(ctx context.Context) { _ = s.membraneSyncAll(ctx) }(ctx)
 	}
 	s.initSideQuestions()
 	// Circuit-breaker thresholds/cooldowns are hot parameters on the failure path; push the global retry policy to the Registry once at startup,

@@ -289,6 +289,11 @@ func (e *Engine) resolveHost(host string, enrol bool) (string, bool) {
 			return "", false
 		}
 		real := prefix + "." + parent
+		if underSharedRoot(real) {
+			// Never derive into a shared multi-tenant root (another
+			// tenant's host): leave it unresolved for the tool guard.
+			return "", false
+		}
 		if enrol {
 			_, _ = e.s.Enroll(KindDomain, real, e.s.provenanceOf(KindDomain, parent))
 		}

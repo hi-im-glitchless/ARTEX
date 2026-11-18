@@ -341,3 +341,49 @@ func TestMembraneSyncTargetRoot(t *testing.T) {
 		t.Fatalf("model view = %q", out)
 	}
 }
+
+// Fix I-B: third-party hosts from assets and auto scope rows enrol nothing:
+// no tenant-label keyword (graph, outlook, fonts) and no root.
+func TestMembraneSyncUnvettedHostsLeftAlone(t *testing.T) {
+	f := newSeedFixture(t)
+	pg := f.m.pg
+	as := pg.Assets()
+	hosts := []string{"outlook.office365.com", "graph.microsoft.com"}
+	t.Cleanup(func() {
+		_, _ = pg.Exec(`DELETE FROM assets WHERE domain = ANY($1) OR root_domain IN ('office365.com','microsoft.com')`, hosts)
+	})
+	for _, h := range hosts {
+		if _, err := as.UpsertSubdomain(db.UpsertSubdomainReq{Domain: h, TaskID: f.taskID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := as.AddAutoScope(f.taskID, "subdomain", "fonts.googleapis.com", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.SyncTask(context.Background(), f.id()); err != nil {
+		t.Fatal(err)
+	}
+	st, e := f.s.membraneStore(), f.s.membraneEngine()
+	for _, w := range []string{"outlook", "graph", "fonts", "office365", "microsoft"} {
+		if _, _, ok := st.AliasFor(w); ok {
+			t.Errorf("unvetted host label %q enrolled as a keyword", w)
+		}
+	}
+	for _, r := range []string{"office365.com", "microsoft.com", "googleapis.com", "outlook.com"} {
+		if st.HasRoot(r) {
+			t.Errorf("%s became a client root", r)
+		}
+	}
+	prose := "test the GraphQL endpoint at /graphql and the graph API; mail via Outlook"
+	out, _, err := e.ToModel(prose, membrane.Provenance{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != prose {
+		t.Fatalf("prose rewritten: %q", out)
+	}
+	// The client's own asset roots are still seeded.
+	if !st.HasRoot("acmebank.pt") {
+		t.Fatal("client root missing")
+	}
+}

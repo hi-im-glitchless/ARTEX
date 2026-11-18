@@ -112,12 +112,17 @@ type Store struct {
 	aliasExact map[string]*entry
 	aliasFold  map[string]*entry // lower(alias) of case-insensitive kinds
 	roots      map[string]string // enrolled real root domain -> alias
-	blocks     []ipBlock
-	dict       *Automaton
-	dictDirty  bool
-	rdict      *Automaton // reverse (alias -> original) automaton
-	rdictGen   uint64     // aliasGen rdict was built at
-	modelKnown map[string]bool
+	// quarantined holds the (lowercase) aliases of stored domain entries
+	// under a shared multi-tenant root (enrolled before the denylist): they
+	// are not indexed, so they neither alias nor resolve nor derive, but an
+	// alias is never minted again.
+	quarantined map[string]bool
+	blocks      []ipBlock
+	dict        *Automaton
+	dictDirty   bool
+	rdict       *Automaton // reverse (alias -> original) automaton
+	rdictGen    uint64     // aliasGen rdict was built at
+	modelKnown  map[string]bool
 	// phones by international core digits (no +/00 prefix) of the original
 	// and of the alias, for the digits-only / + / 00 variants.
 	phoneOrig  map[string]*entry
@@ -266,6 +271,7 @@ func (s *Store) reload() error {
 	s.mu.Lock()
 	s.byKey, s.origSens, s.origFold = fresh.byKey, fresh.origSens, fresh.origFold
 	s.aliasExact, s.aliasFold, s.roots = fresh.aliasExact, fresh.aliasFold, fresh.roots
+	s.quarantined = fresh.quarantined
 	s.phoneOrig, s.phoneAlias = fresh.phoneOrig, fresh.phoneAlias
 	s.blocks = fresh.blocks
 	s.dict, s.dictDirty = nil, true
@@ -282,12 +288,22 @@ func (s *Store) resetMaps() {
 	s.aliasExact = map[string]*entry{}
 	s.aliasFold = map[string]*entry{}
 	s.roots = map[string]string{}
+	s.quarantined = map[string]bool{}
 	s.phoneOrig = map[string]*entry{}
 	s.phoneAlias = map[string]*entry{}
 }
 
 // indexEntry adds e to the maps. Caller holds mu (or owns s exclusively).
 func (s *Store) indexEntry(e *entry) {
+	if e.kind == KindDomain && underSharedRoot(e.norm) {
+		// Stored before the shared-root denylist (Task 9 fix I-A):
+		// okta.com must not act as a client root, and its old alias must
+		// stay unresolved rather than become a scan target.
+		for _, a := range append([]string{e.alias}, e.retired...) {
+			s.quarantined[strings.ToLower(a)] = true
+		}
+		return
+	}
 	s.byKey[string(e.kind)+"\x00"+e.norm] = e
 	if foldKind(e.kind) {
 		if _, ok := s.origFold[e.norm]; !ok {
@@ -640,7 +656,8 @@ func (s *Store) enrollLocked(kind Kind, original string, prov Provenance, mode e
 func (s *Store) aliasTaken(alias string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.aliasExact[alias] != nil || s.aliasFold[strings.ToLower(alias)] != nil
+	return s.aliasExact[alias] != nil || s.aliasFold[strings.ToLower(alias)] != nil ||
+		s.quarantined[strings.ToLower(alias)]
 }
 
 // isOriginal reports whether v (any case) is an enrolled original.
