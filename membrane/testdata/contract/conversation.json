@@ -1,0 +1,180 @@
+{
+  "_comment": "Scripted synthetic transcript. 'input' is what the fake model emits (alias space, templates resolved from the request it received: {{a:X}} = the alias of X, which must be visible in that request; {{ip:X}} = the alias address of X; {{jwt}} = the JWT in the request; {{reason:N}} = the token of the N-th tool guard block reason in the request). 'expect' is the exact tool input the harness must execute (real values). 'result' is the real-space tool output fed back. 'blocked' calls must be refused by the tool guard and never executed.",
+  "steps": [
+    {
+      "label": "host listing",
+      "calls": [
+        {
+          "tool": "bash",
+          "input": {"command": "dig +short {{a:portal.acmebank.pt}} {{a:vpn.acmebank.pt}}"},
+          "expect": {"command": "dig +short portal.acmebank.pt vpn.acmebank.pt"},
+          "result": "portal.acmebank.pt.   300 IN A     185.12.40.10\nvpn.acmebank.pt.      300 IN A     185.12.40.11\nmail.acmebank.pt.     300 IN A     185.12.40.25\nsso.acmebank.pt.      300 IN CNAME acme.okta.com.\nacme.okta.com.        60  IN A     52.6.70.130\n"
+        }
+      ]
+    },
+    {
+      "label": "verbose HTTP exchange",
+      "calls": [
+        {
+          "tool": "http",
+          "input": {"method": "POST", "url": "https://{{a:portal.acmebank.pt}}/api/login", "body": "{\"username\":\"{{a:jsilva}}\",\"password\":\"{{a:Hunter2024!}}\"}"},
+          "expect": {"method": "POST", "url": "https://portal.acmebank.pt/api/login", "body": "{\"username\":\"jsilva\",\"password\":\"Hunter2024!\"}"},
+          "result": "> POST /api/login HTTP/1.1\r\n> Host: portal.acmebank.pt\r\n> Content-Type: application/json\r\n>\r\n< HTTP/1.1 200 OK\r\n< Set-Cookie: session=9f2c4e7a1b3d5f6081a2c4e6b8d0f1a3; Path=/; HttpOnly; Secure\r\n< Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJqc2lsdmEiLCJlbWFpbCI6ImpvYW8uc2lsdmFAYWNtZWJhbmsucHQiLCJodHRwczovL2FjbWViYW5rLnB0L3JvbGVzIjpbInRlbGxlciJdLCJpc3MiOiJodHRwczovL3Nzby5hY21lYmFuay5wdCIsImlhdCI6MTc2MzM4MDgwMH0.Qm9yZWFsU2lnbmF0dXJlRm9yQ29udHJhY3RUZXN0czE\r\n< Content-Type: application/json\r\n<\r\n{\"ok\":true}"
+        }
+      ]
+    },
+    {
+      "label": "user record response",
+      "calls": [
+        {
+          "tool": "http",
+          "input": {"method": "GET", "url": "https://{{a:portal.acmebank.pt}}/api/users/2", "headers": {"Cookie": "session={{a:9f2c4e7a1b3d5f6081a2c4e6b8d0f1a3}}"}},
+          "expect": {"method": "GET", "url": "https://portal.acmebank.pt/api/users/2", "headers": {"Cookie": "session=9f2c4e7a1b3d5f6081a2c4e6b8d0f1a3"}},
+          "result": "{\"id\":2,\"username\":\"mferreira\",\"email\":\"maria.ferreira@acmebank.pt\",\"password\":\"Lisboa#2025\",\"phone\":\"+351 912 345 678\",\"role\":\"admin\"}"
+        }
+      ]
+    },
+    {
+      "label": "second account login",
+      "calls": [
+        {
+          "tool": "http",
+          "input": {"method": "POST", "url": "https://{{a:portal.acmebank.pt}}/api/login", "body": "{\"username\":\"{{a:mferreira}}\",\"password\":\"{{a:Lisboa#2025}}\"}"},
+          "expect": {"method": "POST", "url": "https://portal.acmebank.pt/api/login", "body": "{\"username\":\"mferreira\",\"password\":\"Lisboa#2025\"}"},
+          "result": "> GET /api/profile HTTP/1.1\r\n> Host: portal.acmebank.pt\r\n> Authorization: Basic bWZlcnJlaXJhOkxpc2JvYSMyMDI1\r\n>\r\n< HTTP/1.1 200 OK\r\n<\r\n{\"user\":\"maria.ferreira@acmebank.pt\"}"
+        }
+      ]
+    },
+    {
+      "label": "token in header",
+      "calls": [
+        {
+          "tool": "http",
+          "input": {"method": "GET", "url": "https://{{a:portal.acmebank.pt}}/api/accounts", "headers": {"Authorization": "Bearer {{jwt}}"}},
+          "expect": {"method": "GET", "url": "https://portal.acmebank.pt/api/accounts", "headers": {"Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJqc2lsdmEiLCJlbWFpbCI6ImpvYW8uc2lsdmFAYWNtZWJhbmsucHQiLCJodHRwczovL2FjbWViYW5rLnB0L3JvbGVzIjpbInRlbGxlciJdLCJpc3MiOiJodHRwczovL3Nzby5hY21lYmFuay5wdCIsImlhdCI6MTc2MzM4MDgwMH0.Qm9yZWFsU2lnbmF0dXJlRm9yQ29udHJhY3RUZXN0czE"}},
+          "result": "{\"accounts\":2}"
+        }
+      ]
+    },
+    {
+      "label": "glued credential flags",
+      "calls": [
+        {
+          "tool": "bash",
+          "input": {"command": "mysql -h db.{{a:acmebank.pt}} -u{{a:mferreira}} -p{{a:Lisboa#2025}} -e 'select 1'"},
+          "expect": {"command": "mysql -h db.acmebank.pt -umferreira -pLisboa#2025 -e 'select 1'"},
+          "result": "ERROR 2003 (HY000): Can't connect to MySQL server\n$ history | tail -2\n  101  mysql -uroot -pDbR00t!2024 -h 10.0.0.5 core\n  102  exit\n"
+        }
+      ]
+    },
+    {
+      "label": "option credential",
+      "calls": [
+        {
+          "tool": "bash",
+          "input": {"command": "app-cli --host={{a:portal.acmebank.pt}} --user={{a:mferreira}} --password={{a:Lisboa#2025}} status"},
+          "expect": {"command": "app-cli --host=portal.acmebank.pt --user=mferreira --password=Lisboa#2025 status"},
+          "result": "status: ok\nExecStart=/usr/bin/sync-agent --user=svc_sync --password=Winter!Pass99\n"
+        }
+      ]
+    },
+    {
+      "label": "git config",
+      "calls": [
+        {
+          "tool": "bash",
+          "input": {"command": "cat ~/.gitconfig"},
+          "expect": {"command": "cat ~/.gitconfig"},
+          "result": "[user]\r\n\tname = Joao Silva\r\n\temail = joao.silva@acmebank.pt\r\n[core]\r\n\tautocrlf = true\r\n"
+        }
+      ]
+    },
+    {
+      "label": "API schema example",
+      "calls": [
+        {
+          "tool": "bash",
+          "input": {"command": "curl -s https://{{a:portal.acmebank.pt}}/openapi.json"},
+          "expect": {"command": "curl -s https://portal.acmebank.pt/openapi.json"},
+          "result": "{\"paths\":{\"/api/login\":{\"post\":{\"requestBody\":{\"content\":{\"application/json\":{\"example\":{\"username\":\"string\",\"password\":\"string\"}}}}}}}}"
+        }
+      ]
+    },
+    {
+      "label": "third-party host",
+      "calls": [
+        {
+          "tool": "bash",
+          "input": {"command": "dig +short acme.okta.com login.okta.com"},
+          "expect": {"command": "dig +short acme.okta.com login.okta.com"},
+          "result": "52.6.70.130\n52.6.70.131\n"
+        },
+        {
+          "tool": "bash",
+          "input": {"command": "curl -sI https://othercorp.{{a:acmebank.pt}}/"},
+          "expect": {"command": "curl -sI https://othercorp.acmebank.pt/"},
+          "result": "curl: (6) Could not resolve host"
+        }
+      ]
+    },
+    {
+      "label": "external callback domain",
+      "calls": [
+        {
+          "tool": "bash",
+          "input": {"command": "curl -s https://c7q2x9.callback-oast.net/ping"},
+          "expect": {"command": "curl -s https://c7q2x9.callback-oast.net/ping"},
+          "result": "pong"
+        }
+      ]
+    },
+    {
+      "label": "subdomain guess",
+      "calls": [
+        {
+          "tool": "bash",
+          "input": {"command": "dig +short dev.{{a:acmebank.pt}} staging.{{a:acmebank.pt}}"},
+          "expect": {"command": "dig +short dev.acmebank.pt staging.acmebank.pt"},
+          "result": "185.12.40.30\n"
+        }
+      ]
+    },
+    {
+      "label": "/28 range",
+      "calls": [
+        {
+          "tool": "bash",
+          "input": {"command": "nmap -sn {{ip:185.12.40.16}}/28"},
+          "expect": {"command": "nmap -sn 185.12.40.16/28"},
+          "result": "Nmap done: 16 IP addresses (2 hosts up)\n185.12.40.17 up\n185.12.40.20 up\n"
+        }
+      ]
+    },
+    {
+      "label": "/16 range",
+      "calls": [
+        {"tool": "bash", "input": {"command": "nmap -sn {{ip:185.12.40.0}}/16"}, "blocked": true}
+      ]
+    },
+    {
+      "label": "unknown aliases",
+      "calls": [
+        {"tool": "bash", "input": {"command": "curl -s https://ffffff.example/"}, "blocked": true},
+        {"tool": "bash", "input": {"command": "ping -c1 240.9.9.9"}, "blocked": true}
+      ]
+    },
+    {
+      "label": "retry from block reason",
+      "calls": [
+        {"tool": "bash", "input": {"command": "curl -s https://{{reason:1}}/"}, "blocked": true},
+        {"tool": "bash", "input": {"command": "ping -c1 {{reason:2}}"}, "blocked": true},
+        {"tool": "bash", "input": {"command": "nmap -sn {{reason:0}}"}, "blocked": true}
+      ]
+    },
+    {
+      "label": "summary",
+      "text": "Done: reviewed {{a:portal.acmebank.pt}} for {{a:Acme Bank}} with {{a:jsilva}}.",
+      "expect_text": "Done: reviewed portal.acmebank.pt for Acme Bank with jsilva."
+    }
+  ]
+}
