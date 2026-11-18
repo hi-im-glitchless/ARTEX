@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/llm"
@@ -48,6 +50,35 @@ var ErrLeakBlocked = errors.New("membrane: request blocked by leak check")
 // Option configures Wrap.
 type Option func(*wrapped)
 
+// Syncer seeds the dictionary from a task's scope, credentials and text
+// (spec §7.1) and returns the task's company ids. The decorator calls it
+// before transforming a request that carries a numeric task id, at most once
+// per syncInterval per task after a success; a failure blocks the request
+// (fail closed: seeded originals would be missing). The company ids go into
+// the provenance of values auto-enrolled from that task's requests, so a
+// company purge can remove them (ruling R16). Errors must not contain
+// originals.
+type Syncer interface {
+	SyncTask(ctx context.Context, taskID string) (companyIDs []int64, err error)
+}
+
+// WithSyncer makes the decorator sync each task's seeds before its requests.
+func WithSyncer(s Syncer) Option {
+	return func(w *wrapped) { w.syncer = s }
+}
+
+// syncInterval is the minimum time between two successful syncs of a task.
+const syncInterval = 30 * time.Second
+
+// maxSyncCache bounds the per-task sync cache; expired entries are pruned
+// when it is exceeded.
+const maxSyncCache = 1024
+
+type syncState struct {
+	at        time.Time
+	companies []int64
+}
+
 // engineAPI is the part of *Engine the decorator uses; tests substitute a
 // faulty engine to prove the leak check blocks.
 type engineAPI interface {
@@ -65,6 +96,11 @@ type wrapped struct {
 	a       Auditor
 	profile string
 	sigs    *sigCache
+
+	syncer Syncer
+	now    func() time.Time
+	syncMu sync.Mutex
+	synced map[string]syncState
 }
 
 // Wrap returns inner behind the identity membrane: every request is
@@ -81,7 +117,8 @@ func Wrap(inner llm.Provider, e *Engine, a Auditor, profile string, opts ...Opti
 }
 
 func wrap(inner llm.Provider, e engineAPI, a Auditor, profile string, opts ...Option) *wrapped {
-	w := &wrapped{inner: inner, e: e, a: a, profile: profile, sigs: newSigCache(sigCacheEntries, sigCacheBytes)}
+	w := &wrapped{inner: inner, e: e, a: a, profile: profile, sigs: newSigCache(sigCacheEntries, sigCacheBytes),
+		now: time.Now, synced: map[string]syncState{}}
 	for _, o := range opts {
 		o(w)
 	}
@@ -134,8 +171,44 @@ func roleFromSession(id string) string {
 	return "other"
 }
 
+// syncTask runs the syncer for a numeric task id (throttled per task after
+// a success) and returns the task's company ids. Requests without a task id
+// (chat conversations, connection tests) are not synced: they rely on the
+// startup sync and structural detection.
+func (w *wrapped) syncTask(ctx context.Context, taskID string) ([]int64, error) {
+	if w.syncer == nil {
+		return nil, nil
+	}
+	if id, err := strconv.ParseInt(taskID, 10, 64); err != nil || id <= 0 {
+		return nil, nil
+	}
+	now := w.now()
+	w.syncMu.Lock()
+	st, ok := w.synced[taskID]
+	w.syncMu.Unlock()
+	if ok && now.Sub(st.at) < syncInterval {
+		return slices.Clone(st.companies), nil
+	}
+	companies, err := w.syncer.SyncTask(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	companies = slices.Clone(companies)
+	w.syncMu.Lock()
+	if len(w.synced) >= maxSyncCache {
+		for k, v := range w.synced {
+			if now.Sub(v.at) >= syncInterval {
+				delete(w.synced, k)
+			}
+		}
+	}
+	w.synced[taskID] = syncState{at: now, companies: companies}
+	w.syncMu.Unlock()
+	return companies, nil
+}
+
 // provenanceFrom: the task id from llmrec (numeric ids only), source "auto".
-// Company ids are seeded by the syncer, not here.
+// Company ids come from the syncer (see syncTask).
 func provenanceFrom(ctx context.Context) Provenance {
 	p := Provenance{Source: "auto"}
 	if id, err := strconv.ParseInt(llmrec.TaskIDFrom(ctx), 10, 64); err == nil {
@@ -163,8 +236,15 @@ func (w *wrapped) prepare(ctx context.Context, req llm.CompletionRequest) (llm.C
 	if w.e == nil {
 		return llm.CompletionRequest{}, m, block("no engine", errors.New("membrane: no engine configured, request not sent"))
 	}
+	companies, err := w.syncTask(ctx, m.taskID)
+	if err != nil {
+		return llm.CompletionRequest{}, m, block("seed sync failed",
+			fmt.Errorf("membrane: request not sent: task seed sync failed: %w", err))
+	}
+	prov := provenanceFrom(ctx)
+	prov.CompanyIDs = companies
 	in, replay := w.stripSignedThinking(req)
-	out, rep, err := w.e.ToModelRequest(in, provenanceFrom(ctx))
+	out, rep, err := w.e.ToModelRequest(in, prov)
 	if err != nil {
 		return llm.CompletionRequest{}, m, block("transform failed", fmt.Errorf("membrane: request not sent: %w", err))
 	}

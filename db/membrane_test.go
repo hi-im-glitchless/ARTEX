@@ -285,3 +285,52 @@ func TestPurgeRules(t *testing.T) {
 		t.Fatalf("tasks = %d, want 1", refs["tasks"])
 	}
 }
+
+// Tasks are linked to companies through task_scope (kind company): the purge
+// keeps entries of a task linked to another company that way, and the guard
+// counts tasks linked that way.
+func TestPurgeRulesTaskScopeCompany(t *testing.T) {
+	d := membraneTestDB(t)
+	cs := d.Companies()
+	c1, _, err := cs.UpsertCompany(fmt.Sprintf("mb-purge-ts-a-%d", time.Now().UnixNano()), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, _, err := cs.UpsertCompany(fmt.Sprintf("mb-purge-ts-b-%d", time.Now().UnixNano()), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cs.DeleteCompany(c1); cs.DeleteCompany(c2) })
+	tk, err := d.CreateTaskWithOptions("purge ts test", "g", TaskCreateOptions{CompanyIDs: []int64{c2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.DeleteTask(tk.ID) })
+	tag := fmt.Sprintf("purge-ts-%d", time.Now().UnixNano())
+	t.Cleanup(func() { d.Exec(`DELETE FROM membrane_entries WHERE original_hmac LIKE $1`, tag+"%") })
+	e, err := d.InsertMembraneEntry(&MembraneEntry{Kind: "domain", OriginalHMAC: tag, OriginalEnc: []byte{1},
+		Alias: tag, Source: "auto", CompanyIDs: []int64{c1}, TaskIDs: []int64{tk.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.PurgeMembraneCompany(c1); err != nil {
+		t.Fatal(err)
+	}
+	list, _ := d.ListMembraneEntries()
+	kept := false
+	for _, x := range list {
+		if x.ID == e.ID {
+			kept = len(x.CompanyIDs) == 0
+		}
+	}
+	if !kept {
+		t.Fatal("entry of a task linked to another company (task_scope) must survive with the company removed")
+	}
+	refs, err := d.MembraneCompanyReferences(c2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refs["tasks"] != 1 {
+		t.Fatalf("guard must count a task linked through task_scope: %v", refs)
+	}
+}

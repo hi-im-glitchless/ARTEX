@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/membrane"
@@ -19,10 +20,13 @@ type MembraneStatus struct {
 	Entries    int    `json:"entries"`
 	KeysSource string `json:"keys_source"`
 	Error      string `json:"error,omitempty"`
+	// SeedError is the last startup seed sync failure (non-fatal: each task
+	// syncs again before its requests). Step names and ids only.
+	SeedError string `json:"seed_error,omitempty"`
 }
 
 // membraneState is built once in New, before any provider, and never changes
-// afterwards, so it is read without a lock.
+// afterwards (except seedErr), so it is read without a lock.
 type membraneState struct {
 	store      *membrane.Store
 	engine     *membrane.Engine
@@ -30,6 +34,8 @@ type membraneState struct {
 	override   bool
 	keysSource membrane.KeysSource
 	err        string
+	// seedErr is written by membraneSyncAll after startup, hence atomic.
+	seedErr atomic.Pointer[string]
 }
 
 // initMembrane opens the membrane store with keys from the environment or
@@ -110,6 +116,7 @@ func (s *Server) attachMembrane(cfg *agent.Config, profile string) {
 	cfg.ProfileName = profile
 	if s.mem.engine != nil && s.mem.audit != nil {
 		cfg.Membrane, cfg.MembraneAudit = s.mem.engine, s.mem.audit
+		cfg.MembraneSyncer = s
 	}
 }
 
@@ -127,6 +134,9 @@ func (s *Server) membraneStatus() MembraneStatus {
 	}
 	if s.mem.store != nil {
 		st.Entries = s.mem.store.Len()
+	}
+	if e := s.mem.seedErr.Load(); e != nil {
+		st.SeedError = *e
 	}
 	return st
 }

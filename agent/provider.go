@@ -96,7 +96,12 @@ type Config struct {
 	// membrane's audit events.
 	Membrane      *membrane.Engine
 	MembraneAudit membrane.Auditor
-	ProfileName   string
+	// MembraneSyncer, when set, seeds each task's scope, credentials and
+	// text before its requests (membrane.WithSyncer). It must stay
+	// comparable (applyLLM compares Configs with ==): the server sets it to
+	// its *Server pointer.
+	MembraneSyncer membrane.Syncer
+	ProfileName    string
 }
 
 // RetryConfig holds the retry parameters that travel with one LLM config. The
@@ -329,7 +334,11 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	if err != nil || !required {
 		return prov, err
 	}
-	return membrane.Wrap(prov, c.Membrane, c.MembraneAudit, c.ProfileName), nil
+	var opts []membrane.Option
+	if c.MembraneSyncer != nil {
+		opts = append(opts, membrane.WithSyncer(c.MembraneSyncer))
+	}
+	return membrane.Wrap(prov, c.Membrane, c.MembraneAudit, c.ProfileName, opts...), nil
 }
 
 // IsQuotaExhaustedMessage deliberately recognizes only explicit balance,

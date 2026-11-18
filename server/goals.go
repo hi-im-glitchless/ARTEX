@@ -29,6 +29,19 @@ func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 	if !s.engine.beginTaskOperation(t.ID) {
 		return
 	}
+	// Seed the identity membrane before anything can reach an LLM (spec
+	// §7.1). Fail closed: a task whose scope or credentials cannot be loaded
+	// into the dictionary does not start.
+	if err := s.membraneSyncTask(t); err != nil {
+		log.Printf("[membrane] task %s not started: %v", t.ID, err)
+		s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "text",
+			Summary: "task not started: identity membrane seed sync failed (fail closed) — " + err.Error()})
+		if _, serr := s.m.SetTaskStatusGuarded(t.ID, "failed"); serr != nil {
+			log.Printf("[membrane] task %s: cannot mark failed: %v", t.ID, serr)
+		}
+		s.engine.decInflight(t.ID)
+		return
+	}
 	s.seed(t, seedText)
 	if seedFirstIntent {
 		s.seedFirstIntent(t)

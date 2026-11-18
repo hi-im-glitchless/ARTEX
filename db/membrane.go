@@ -415,8 +415,8 @@ func (d *DB) VerifyMembraneChain() (ok bool, firstBadID int64, err error) {
 }
 
 // PurgeMembraneCompany deletes entries referenced only by companyID (whose
-// tasks, if any, are not owned by another company; hard-deleted tasks no
-// longer count) and removes companyID from the provenance
+// tasks, if any, are not linked to another company through tasks.company_id
+// or a task_scope company row; hard-deleted tasks no longer count) and removes companyID from the provenance
 // of the rest. Returns the number of deleted entries. The caller records the
 // audit event and enforces the references guard.
 func (d *DB) PurgeMembraneCompany(companyID int64) (int, error) {
@@ -430,7 +430,9 @@ DELETE FROM membrane_entries e
 WHERE e.company_ids = ARRAY[$1]::bigint[]
   AND NOT EXISTS (
       SELECT 1 FROM unnest(e.task_ids) t JOIN tasks k ON k.id = t
-      WHERE k.company_id IS NOT NULL AND k.company_id <> $1)`, companyID)
+      WHERE (k.company_id IS NOT NULL AND k.company_id <> $1)
+         OR EXISTS (SELECT 1 FROM task_scope ts WHERE ts.task_id = k.id
+                    AND ts.kind = 'company' AND ts.company_id <> $1))`, companyID)
 	if err != nil {
 		return 0, err
 	}
@@ -442,15 +444,21 @@ WHERE e.company_ids = ARRAY[$1]::bigint[]
 	return int(n), tx.Commit()
 }
 
+// taskOfCompany matches a task t linked to company $1: through task_scope
+// (kind company, how tasks are linked to companies) or the legacy
+// tasks.company_id column.
+const taskOfCompany = `(t.company_id=$1 OR EXISTS (SELECT 1 FROM task_scope ts
+	WHERE ts.task_id=t.id AND ts.kind='company' AND ts.company_id=$1))`
+
 // MembraneCompanyReferences counts the live real data that can still reach a
 // prompt for companyID. Purge must be refused while any count is non-zero.
 func (d *DB) MembraneCompanyReferences(companyID int64) (map[string]int, error) {
 	out := map[string]int{}
 	queries := []struct{ key, q string }{
-		{"tasks", `SELECT count(*) FROM tasks WHERE company_id=$1 AND deleted_at IS NULL`},
+		{"tasks", `SELECT count(*) FROM tasks t WHERE t.deleted_at IS NULL AND ` + taskOfCompany},
 		{"assets", `SELECT count(*) FROM assets WHERE company_id=$1`},
 		{"findings", `SELECT count(*) FROM findings f JOIN tasks t ON t.id=f.task_id
-			WHERE t.company_id=$1 AND t.deleted_at IS NULL`},
+			WHERE t.deleted_at IS NULL AND ` + taskOfCompany},
 		{"lessons", `SELECT count(*) FROM rsi_lessons WHERE company_id=$1`},
 		{"scope", `SELECT count(*) FROM company_scope WHERE company_id=$1`},
 	}
