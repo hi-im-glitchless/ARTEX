@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/net/idna"
 	"golang.org/x/net/publicsuffix"
@@ -24,12 +26,17 @@ import (
 // client values the database already knows are enrolled, so they are aliased
 // even where no structural detector would find them:
 //   - linked companies: name and its brand variants, company_scope rows
-//     (domain + brand variant, ip, cidr, keyword, icp) and the root domains
-//     and IPs of the company's assets;
+//     (domain, ip, cidr, keyword, icp) and the hosts and IPs of the
+//     company's assets;
 //   - the task: task_scope rows, task_credentials (domain, username,
-//     password), the target host of the description/goal, the root domains
-//     and IPs of its own assets, and the structural detections in its
+//     password), the target host of the description/goal, the hosts and
+//     IPs of its own assets, and the structural detections in its
 //     description and goal (engine.ToModel, output discarded).
+//
+// Hosts are classified by their registrable root (classifiedHost): only
+// declared roots and roots whose label carries a client keyword become
+// client roots (Store.EnrollRoot, plus the root's brand variant); a
+// third-party root is never enrolled, only the tenant label of its host.
 //
 // Company-level values carry provenance {company}; task-level values carry
 // {task companies, task}. Source is always "seed". Errors name the step, never
@@ -139,22 +146,39 @@ func (s *Server) membraneSyncTaskID(ctx context.Context, id int64) ([]int64, err
 	if err != nil {
 		return nil, fmt.Errorf("membrane seed: load task scope: %w", err)
 	}
+	target := ""
+	if _, host, _, ok := parseTarget(task.Description + " " + task.Goal); ok && host != s.llmHost() {
+		target = host
+	}
+	// Pass 1: keywords and declared roots, so pass 2 can classify hosts.
+	// Declared: a root_domain row not added automatically (source manual,
+	// set by the UI, or agent, set by add_task_scope; insertAssets writes
+	// auto), and a task target written as a bare root domain.
+	for _, r := range scope {
+		var err error
+		switch {
+		case r.Kind == "keyword" || r.Kind == "icp":
+			err = sd.keyword(r.Value, prov)
+		case r.Kind == "root_domain" && r.Source != "auto":
+			err = sd.declareRoot(r.Domain, prov)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("membrane seed: task scope %s row %d: %w", r.Kind, r.ID, err)
+		}
+	}
+	if target != "" && isBareRoot(target) {
+		if err := sd.declareRoot(target, prov); err != nil {
+			return nil, fmt.Errorf("membrane seed: task target: %w", err)
+		}
+	}
+	// Pass 2: hosts (classified client / third party) and networks.
 	for _, r := range scope {
 		var err error
 		switch r.Kind {
-		case "root_domain":
-			err = sd.host(r.Domain, prov)
-			if err == nil && r.Source != "auto" {
-				// Brand inference only from deliberately added roots: an
-				// auto row may be a third-party root an agent recorded.
-				err = sd.keywords(prov, membrane.BrandVariants(r.Domain)...)
-			}
-		case "subdomain":
+		case "root_domain", "subdomain":
 			err = sd.host(r.Domain, prov)
 		case "ip", "cidr":
 			err = sd.network(r.Net, prov)
-		case "keyword", "icp":
-			err = sd.keyword(r.Value, prov)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("membrane seed: task scope %s row %d: %w", r.Kind, r.ID, err)
@@ -171,8 +195,8 @@ func (s *Server) membraneSyncTaskID(ctx context.Context, id int64) ([]int64, err
 		}
 	}
 
-	if _, host, _, ok := parseTarget(task.Description + " " + task.Goal); ok && host != s.llmHost() {
-		if err := sd.host(host, prov); err != nil {
+	if target != "" {
+		if err := sd.host(target, prov); err != nil {
 			return nil, fmt.Errorf("membrane seed: task target: %w", err)
 		}
 	}
@@ -190,6 +214,9 @@ type seeder struct {
 	s  *Server
 	st *membrane.Store
 	e  *membrane.Engine
+	// seen dedupes tenant labels within one sync (each Enroll of an
+	// existing keyword costs a re-mint scan).
+	seen map[string]bool
 }
 
 // seeder returns nil when the membrane is off or not initialised: nothing to
@@ -198,7 +225,7 @@ func (s *Server) seeder() *seeder {
 	if s.mem.store == nil || s.mem.engine == nil || s.m == nil || s.m.pg == nil {
 		return nil
 	}
-	return &seeder{s: s, st: s.mem.store, e: s.mem.engine}
+	return &seeder{s: s, st: s.mem.store, e: s.mem.engine, seen: map[string]bool{}}
 }
 
 // company seeds one company's name, brand variants, scope and assets with
@@ -220,17 +247,27 @@ func (sd *seeder) company(cid int64) error {
 	if err != nil {
 		return fmt.Errorf("load company scope: %w", err)
 	}
+	// Pass 1: keywords and declared roots (a scope domain that is itself a
+	// registrable root); pass 2: other hosts, classified, and networks.
 	for _, r := range rules {
 		var err error
-		switch r.Kind {
-		case "domain":
-			if err = sd.host(r.Domain, prov); err == nil {
-				err = sd.keywords(prov, membrane.BrandVariants(r.Domain)...)
-			}
-		case "ip", "cidr":
-			err = sd.network(r.Net, prov)
-		case "keyword", "icp":
+		switch {
+		case r.Kind == "keyword" || r.Kind == "icp":
 			err = sd.keyword(r.Value, prov)
+		case r.Kind == "domain" && isBareRoot(r.Domain):
+			err = sd.declareRoot(r.Domain, prov)
+		}
+		if err != nil {
+			return fmt.Errorf("company scope %s row %d: %w", r.Kind, r.ID, err)
+		}
+	}
+	for _, r := range rules {
+		var err error
+		switch {
+		case r.Kind == "domain" && !isBareRoot(r.Domain):
+			err = sd.host(r.Domain, prov)
+		case r.Kind == "ip" || r.Kind == "cidr":
+			err = sd.network(r.Net, prov)
 		}
 		if err != nil {
 			return fmt.Errorf("company scope %s row %d: %w", r.Kind, r.ID, err)
@@ -242,13 +279,16 @@ func (sd *seeder) company(cid int64) error {
 	return nil
 }
 
-// assets seeds the distinct root domains and IPs of the assets matching
+// assets seeds the distinct host names and IPs of the assets matching
 // where (one bigint parameter $1), in keyset-paginated batches. Only those
-// two columns are read: subdomains alias through their root, and the scan
-// stays cheap on a large asset table.
+// columns are read. A host under a client root only ensures the root
+// (subdomains alias through it); a third-party host contributes its tenant
+// label (see host).
 func (sd *seeder) assets(where string, arg int64, prov membrane.Provenance) error {
 	q := `
 SELECT v FROM (
+    SELECT domain AS v FROM assets WHERE ` + where + ` AND COALESCE(domain,'') <> ''
+    UNION
     SELECT root_domain AS v FROM assets WHERE ` + where + ` AND COALESCE(root_domain,'') <> ''
     UNION
     SELECT ip AS v FROM assets WHERE ` + where + ` AND COALESCE(ip,'') <> ''
@@ -274,7 +314,7 @@ SELECT v FROM (
 			return err
 		}
 		for _, v := range vals {
-			if err := sd.host(v, prov); err != nil {
+			if err := sd.classifiedHost(v, prov, true); err != nil {
 				return err
 			}
 		}
@@ -306,12 +346,26 @@ func (sd *seeder) keywords(prov membrane.Provenance, vs ...string) error {
 	return nil
 }
 
-// host enrols a domain (its root comes with it) or an IP address. Values
-// that are not a registrable host name (single labels such as "localhost",
-// a bare public suffix, URLs that do not parse) are skipped: the store
-// cannot alias them as domains, and refusing the whole sync over one would
-// block the task for good.
+// host enrols a host name or an IP address (see classifiedHost).
 func (sd *seeder) host(h string, prov membrane.Provenance) error {
+	return sd.classifiedHost(h, prov, false)
+}
+
+// classifiedHost enrols an IP address, or classifies a host name by its
+// registrable root (Task 9 fix C1):
+//   - client root: already enrolled, or its label carries an enrolled client
+//     keyword (then opted in with EnrollRoot) -> the host is enrolled as a
+//     domain (rootOnly: just the root);
+//   - otherwise third party (okta.com under acme.okta.com): no domain or root
+//     is ever enrolled for it, so derivation can never map a model's host
+//     onto another tenant; the host's tenant label, if distinctive, is
+//     enrolled as an org keyword so acme.okta.com reaches the model as
+//     org-xxxx.okta.com.
+//
+// Values that are not a registrable host name (single labels such as
+// "localhost", a bare public suffix, URLs that do not parse) are skipped:
+// refusing the whole sync over one would block the task for good.
+func (sd *seeder) classifiedHost(h string, prov membrane.Provenance, rootOnly bool) error {
 	h = hostOf(h)
 	if h == "" {
 		return nil
@@ -319,11 +373,110 @@ func (sd *seeder) host(h string, prov membrane.Provenance) error {
 	if a, err := netip.ParseAddr(h); err == nil {
 		return sd.ip(a, prov)
 	}
-	if !registrableHost(h) {
+	h, root, ok := registrableRoot(h)
+	if !ok {
 		return nil
 	}
-	_, err := sd.st.Enroll(membrane.KindDomain, h, prov)
+	client, err := sd.clientRoot(root, prov)
+	if err != nil {
+		return err
+	}
+	if !client {
+		return sd.tenantLabel(h, root, prov)
+	}
+	if rootOnly {
+		h = root
+	}
+	_, err = sd.st.Enroll(membrane.KindDomain, h, prov)
 	return err
+}
+
+// clientRoot reports whether root is client space, opting in a root whose
+// label carries an enrolled client keyword (with its brand variant).
+func (sd *seeder) clientRoot(root string, prov membrane.Provenance) (bool, error) {
+	if sd.st.HasRoot(root) {
+		return true, nil
+	}
+	label, _, _ := strings.Cut(root, ".")
+	if !sd.st.LabelHasClientKeyword(label) {
+		return false, nil
+	}
+	return true, sd.enrollRoot(root, prov)
+}
+
+// declareRoot opts in a root the operator declared (a company scope domain
+// or a non-auto task root_domain row that is a registrable root, a task
+// target written as a bare root) and enrols its brand variant. Anything
+// else goes through classification.
+func (sd *seeder) declareRoot(d string, prov membrane.Provenance) error {
+	h, root, ok := registrableRoot(hostOf(d))
+	if !ok {
+		return nil
+	}
+	if h != root {
+		return sd.host(h, prov)
+	}
+	return sd.enrollRoot(root, prov)
+}
+
+func (sd *seeder) enrollRoot(root string, prov membrane.Provenance) error {
+	if _, err := sd.st.EnrollRoot(root, prov); err != nil {
+		return err
+	}
+	// Brand inference only from client roots (Task 9 fix I1).
+	return sd.keywords(prov, membrane.BrandVariants(root)...)
+}
+
+// tenantLabel enrols the distinctive label of a third-party host nearest to
+// its root (acme in acme.okta.com, acme in acme.my.salesforce.com) as an
+// org keyword. Generic labels (www, login, portal...), labels shorter than 4
+// or containing digits (regions, shards, hashes) are not tenant names.
+func (sd *seeder) tenantLabel(h, root string, prov membrane.Provenance) error {
+	prefix := strings.TrimSuffix(strings.TrimSuffix(h, root), ".")
+	if prefix == "" {
+		return nil
+	}
+	labels := strings.Split(prefix, ".")
+	for i := len(labels) - 1; i >= 0; i-- {
+		l := labels[i]
+		if !distinctiveLabel(l) {
+			continue
+		}
+		if sd.seen[l] {
+			return nil
+		}
+		sd.seen[l] = true
+		_, err := sd.st.Enroll(membrane.KindOrg, l, prov)
+		return err
+	}
+	return nil
+}
+
+// genericLabels are host labels that name a function, not a tenant.
+var genericLabels = map[string]bool{
+	"www": true, "api": true, "apis": true, "app": true, "apps": true, "login": true, "logon": true,
+	"signin": true, "portal": true, "auth": true, "oauth": true, "sso": true, "idp": true, "mail": true,
+	"webmail": true, "smtp": true, "imap": true, "admin": true, "test": true, "tests": true, "dev": true,
+	"devel": true, "stage": true, "staging": true, "prod": true, "production": true, "preprod": true,
+	"uat": true, "qa": true, "sandbox": true, "cdn": true, "static": true, "assets": true, "media": true,
+	"images": true, "img": true, "files": true, "download": true, "downloads": true, "web": true,
+	"secure": true, "vpn": true, "remote": true, "gateway": true, "proxy": true, "edge": true, "my": true,
+	"account": true, "accounts": true, "console": true, "dashboard": true, "help": true, "support": true,
+	"docs": true, "status": true, "blog": true, "shop": true, "store": true, "cloud": true, "online": true,
+	"service": true, "services": true, "public": true, "internal": true, "beta": true, "demo": true,
+	"git": true, "jira": true, "wiki": true, "confluence": true, "mobile": true, "home": true, "info": true,
+	"news": true, "events": true, "community": true, "forum": true, "data": true, "analytics": true,
+	"metrics": true, "monitor": true, "monitoring": true, "backup": true, "storage": true, "s3": true,
+	"default": true, "global": true, "europe": true, "east": true, "west": true, "north": true,
+	"south": true, "central": true, "origin": true, "mx": true, "ns": true, "autodiscover": true,
+	"lyncdiscover": true, "enterpriseregistration": true, "enterpriseenrollment": true, "selector": true,
+}
+
+func distinctiveLabel(l string) bool {
+	if utf8.RuneCountInString(l) < 4 || genericLabels[l] || strings.HasPrefix(l, "xn--") {
+		return false
+	}
+	return !strings.ContainsFunc(l, unicode.IsDigit)
 }
 
 func (sd *seeder) ip(a netip.Addr, prov membrane.Provenance) error {
@@ -409,16 +562,26 @@ func hostOf(v string) string {
 	return strings.TrimSuffix(strings.ToLower(v), ".")
 }
 
-// registrableHost reports whether h is a host name under a registrable
-// domain (what Store.Enroll(KindDomain) accepts).
-func registrableHost(h string) bool {
+// registrableRoot returns h in ASCII (punycode) form and its registrable
+// root; ok is false when h is not a host name under a registrable domain.
+func registrableRoot(h string) (host, root string, ok bool) {
 	if strings.ContainsAny(h, " \t\r\n/@:") {
-		return false
+		return "", "", false
 	}
 	a, err := idna.Punycode.ToASCII(h)
 	if err != nil {
-		return false
+		return "", "", false
 	}
-	_, err = publicsuffix.EffectiveTLDPlusOne(a)
-	return err == nil
+	a = strings.ToLower(a)
+	r, err := publicsuffix.EffectiveTLDPlusOne(a)
+	if err != nil {
+		return "", "", false
+	}
+	return a, r, true
+}
+
+// isBareRoot reports whether d is itself a registrable root domain.
+func isBareRoot(d string) bool {
+	h, root, ok := registrableRoot(hostOf(d))
+	return ok && h == root
 }

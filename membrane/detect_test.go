@@ -64,7 +64,7 @@ func newTestPipeline(t *testing.T, enrol ...[2]string) (*Pipeline, *Store) {
 	t.Helper()
 	s, _ := newTestStore(t)
 	for _, e := range enrol {
-		if _, err := s.Enroll(Kind(e[0]), e[1], seedProv); err != nil {
+		if _, err := s.seedEnroll(Kind(e[0]), e[1], seedProv); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -303,7 +303,7 @@ func (f fixedDetector) Detect(string) []Span { return f }
 
 func TestPipelineOverlapOrder(t *testing.T) {
 	s, _ := newTestStore(t)
-	if _, err := s.Enroll(KindDomain, "acmebank.pt", seedProv); err != nil {
+	if _, err := s.seedEnroll(KindDomain, "acmebank.pt", seedProv); err != nil {
 		t.Fatal(err)
 	}
 	text := "x acmebank.pt y"
@@ -353,7 +353,7 @@ func TestKeywordShortTermsNeedBoundary(t *testing.T) {
 	noSpan(t, text, spans, "Ingress")
 
 	ing, _, _ := s.AliasFor("ing")
-	a, err := s.Enroll(KindDomain, "billing.ing-vpn.acme.pt", seedProv)
+	a, err := s.seedEnroll(KindDomain, "billing.ing-vpn.acme.pt", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +372,7 @@ func FuzzPipelineDetect(f *testing.F) {
 		f.Fatal(err)
 	}
 	for _, e := range [][2]string{{"domain", "acmebank.pt"}, {"org", "acme"}, {"org", "acmebank"}, {"password", "S3cret"}} {
-		if _, err := s.Enroll(Kind(e[0]), e[1], seedProv); err != nil {
+		if _, err := s.seedEnroll(Kind(e[0]), e[1], seedProv); err != nil {
 			f.Fatal(err)
 		}
 	}
@@ -388,7 +388,7 @@ func BenchmarkPipelineDetect(b *testing.B) {
 		b.Fatal(err)
 	}
 	for _, e := range [][2]string{{"domain", "acmebank.pt"}, {"org", "acme"}, {"org", "acmebank"}, {"password", "S3cret"}} {
-		if _, err := s.Enroll(Kind(e[0]), e[1], seedProv); err != nil {
+		if _, err := s.seedEnroll(Kind(e[0]), e[1], seedProv); err != nil {
 			b.Fatal(err)
 		}
 	}

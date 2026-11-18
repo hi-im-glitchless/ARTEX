@@ -14,7 +14,7 @@ import (
 
 func TestJWTKeysAndNumbersAliased(t *testing.T) {
 	e, s := newTestEngine(t)
-	if _, err := s.Enroll(KindNIF, "123456789", seedProv); err != nil {
+	if _, err := s.seedEnroll(KindNIF, "123456789", seedProv); err != nil {
 		t.Fatal(err)
 	}
 	enc := base64.RawURLEncoding.EncodeToString
@@ -85,7 +85,7 @@ func TestShortCredentialsMatchAsTokens(t *testing.T) {
 		k Kind
 		v string
 	}{{KindPassword, "1234"}, {KindUsername, "bob"}} {
-		if _, err := s.Enroll(v.k, v.v, seedProv); err != nil {
+		if _, err := s.seedEnroll(v.k, v.v, seedProv); err != nil {
 			t.Fatal(err)
 		}
 	}

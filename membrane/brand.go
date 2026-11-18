@@ -63,6 +63,16 @@ func registrableLabel(name string) (string, bool) {
 	return label, true
 }
 
+// LabelHasClientKeyword reports whether label (a registrable domain's label,
+// e.g. "acmebank-online") contains an enrolled org or product keyword under
+// the dictionary's matching rules (R10 boundaries for short keywords). The
+// seeder treats such a root as client space.
+func (s *Store) LabelHasClientKeyword(label string) bool {
+	return len(s.Dictionary().findAll(label, func(k Kind) bool {
+		return k == KindOrg || k == KindProduct
+	})) > 0
+}
+
 func keepVariants(vs ...string) []string {
 	var out []string
 	for _, v := range vs {

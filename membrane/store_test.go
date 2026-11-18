@@ -151,14 +151,14 @@ func newTestStore(t *testing.T) (*Store, *fakePersistence) {
 
 func TestEnrollIdempotent(t *testing.T) {
 	s, p := newTestStore(t)
-	a1, err := s.Enroll(KindDomain, "acmebank.pt", seedProv)
+	a1, err := s.seedEnroll(KindDomain, "acmebank.pt", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !regexp.MustCompile(`^[0-9a-f]{6}\.example$`).MatchString(a1) {
 		t.Fatalf("bad root alias %q", a1)
 	}
-	a2, err := s.Enroll(KindDomain, "AcmeBank.PT.", seedProv)
+	a2, err := s.seedEnroll(KindDomain, "AcmeBank.PT.", seedProv)
 	if err != nil || a2 != a1 {
 		t.Fatalf("not idempotent: %q %q %v", a1, a2, err)
 	}
@@ -189,7 +189,7 @@ func TestEnrollIdempotent(t *testing.T) {
 
 func TestEnrollSubdomainKeepsLabels(t *testing.T) {
 	s, _ := newTestStore(t)
-	sub, err := s.Enroll(KindDomain, "portal.acmebank.pt", seedProv)
+	sub, err := s.seedEnroll(KindDomain, "portal.acmebank.pt", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,11 +201,11 @@ func TestEnrollSubdomainKeepsLabels(t *testing.T) {
 		t.Fatalf("sub alias %q, root %q", sub, root)
 	}
 	// Keyword labels are replaced with the lowercase keyword alias.
-	kw, err := s.Enroll(KindOrg, "AcmeBank", seedProv)
+	kw, err := s.seedEnroll(KindOrg, "AcmeBank", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	vpn, err := s.Enroll(KindDomain, "acmebank-vpn.acmebank.pt", seedProv)
+	vpn, err := s.seedEnroll(KindDomain, "acmebank-vpn.acmebank.pt", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestEnrollSubdomainKeepsLabels(t *testing.T) {
 
 func TestEnrollEmail(t *testing.T) {
 	s, _ := newTestStore(t)
-	a, err := s.Enroll(KindEmail, "Joao.Silva@AcmeBank.pt", seedProv)
+	a, err := s.seedEnroll(KindEmail, "Joao.Silva@AcmeBank.pt", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestEnrollEmail(t *testing.T) {
 	if !regexp.MustCompile(`^user-[0-9a-f]{4}@` + regexp.QuoteMeta(root) + `$`).MatchString(a) {
 		t.Fatalf("email alias %q", a)
 	}
-	g, err := s.Enroll(KindEmail, "someone@gmail.com", seedProv)
+	g, err := s.seedEnroll(KindEmail, "someone@gmail.com", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func TestEnrollConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			aliases[i], errs[i] = s.Enroll(KindDomain, "portal.acmebank.pt", seedProv)
+			aliases[i], errs[i] = s.seedEnroll(KindDomain, "portal.acmebank.pt", seedProv)
 			_ = s.Dictionary().FindAll("portal.acmebank.pt")
 		}(i)
 	}
@@ -269,11 +269,11 @@ func TestKeywordCollisionRehash(t *testing.T) {
 		}
 		return fmt.Sprintf("%s-%04x", strings.ToUpper(string(kind)), attempt)
 	}
-	a, err := s.Enroll(KindOrg, "Acme", seedProv)
+	a, err := s.seedEnroll(KindOrg, "Acme", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := s.Enroll(KindOrg, "Globex", seedProv)
+	b, err := s.seedEnroll(KindOrg, "Globex", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestKeywordCollisionRehashDeterministic(t *testing.T) {
 	want := map[string]string{}
 	for i := 0; i < 300; i++ {
 		term := fmt.Sprintf("brand%d", i)
-		a, err := s.Enroll(KindProduct, term, seedProv)
+		a, err := s.seedEnroll(KindProduct, term, seedProv)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -353,7 +353,7 @@ func TestIPv4BlockPreservesLastOctet(t *testing.T) {
 		}
 	}
 	// Enroll(KindIPv4) is the same path.
-	e, err := s.Enroll(KindIPv4, "185.12.40.17", seedProv)
+	e, err := s.seedEnroll(KindIPv4, "185.12.40.17", seedProv)
 	if err != nil || e != a.String() {
 		t.Fatalf("Enroll ipv4 = %q %v", e, err)
 	}
@@ -423,7 +423,7 @@ func TestSeedCIDRAfterIPKeepsOldAlias(t *testing.T) {
 
 func TestOpenStoreFailsOnWrongKey(t *testing.T) {
 	s, p := newTestStore(t)
-	if _, err := s.Enroll(KindPassword, "hunter2!", seedProv); err != nil {
+	if _, err := s.seedEnroll(KindPassword, "hunter2!", seedProv); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := OpenStore(p, bytes.Repeat([]byte{0x33}, 32), testHMACKey); err == nil {
@@ -440,7 +440,7 @@ func TestOpenStoreFailsOnWrongKey(t *testing.T) {
 func TestAutomatonCaseInsensitiveDomainsExactSecrets(t *testing.T) {
 	s, _ := newTestStore(t)
 	mustEnroll := func(k Kind, v string) string {
-		a, err := s.Enroll(k, v, seedProv)
+		a, err := s.seedEnroll(k, v, seedProv)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -495,7 +495,7 @@ func TestAutomatonLongestMatch(t *testing.T) {
 		if strings.Contains(v, ".") {
 			k = KindDomain
 		}
-		if _, err := s.Enroll(k, v, seedProv); err != nil {
+		if _, err := s.seedEnroll(k, v, seedProv); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -512,7 +512,7 @@ func TestAutomatonLongestMatch(t *testing.T) {
 
 func TestModelKnown(t *testing.T) {
 	s, _ := newTestStore(t)
-	if _, err := s.Enroll(KindDomain, "acmebank.pt", seedProv); err != nil {
+	if _, err := s.seedEnroll(KindDomain, "acmebank.pt", seedProv); err != nil {
 		t.Fatal(err)
 	}
 	s.MarkModelKnown("Example-Vendor.com.")
@@ -575,11 +575,11 @@ func TestLoadKeys(t *testing.T) {
 func TestErrorsNeverContainOriginals(t *testing.T) {
 	s, p := newTestStore(t)
 	// Make "secretcorp" a keyword so a crafted host collides with a real one.
-	kw, err := s.Enroll(KindOrg, "secretcorp", seedProv)
+	kw, err := s.seedEnroll(KindOrg, "secretcorp", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Enroll(KindDomain, strings.ToLower(kw)+"-vpn.secretcorp.pt", seedProv); err != nil {
+	if _, err := s.seedEnroll(KindDomain, strings.ToLower(kw)+"-vpn.secretcorp.pt", seedProv); err != nil {
 		t.Fatal(err)
 	}
 	type tc struct {
@@ -587,7 +587,7 @@ func TestErrorsNeverContainOriginals(t *testing.T) {
 		run          func() error
 	}
 	enroll := func(k Kind, v string) func() error {
-		return func() error { _, err := s.Enroll(k, v, seedProv); return err }
+		return func() error { _, err := s.seedEnroll(k, v, seedProv); return err }
 	}
 	cases := []tc{
 		{"domain with space", "secretcorp", enroll(KindDomain, "secretcorp portal.pt")},
@@ -633,18 +633,18 @@ func TestErrorsNeverContainOriginals(t *testing.T) {
 
 func TestKeywordAfterSubdomainRemints(t *testing.T) {
 	s, p := newTestStore(t)
-	old, err := s.Enroll(KindDomain, "acmebank-vpn.acmebank.pt", seedProv)
+	old, err := s.seedEnroll(KindDomain, "acmebank-vpn.acmebank.pt", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldMail, err := s.Enroll(KindEmail, "ops@acmebank-vpn.acmebank.pt", seedProv)
+	oldMail, err := s.seedEnroll(KindEmail, "ops@acmebank-vpn.acmebank.pt", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(old, "acmebank") {
 		t.Fatalf("precondition: %q should still carry the label", old)
 	}
-	kw, err := s.Enroll(KindOrg, "AcmeBank", seedProv)
+	kw, err := s.seedEnroll(KindOrg, "AcmeBank", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -686,11 +686,11 @@ func TestKeywordAfterSubdomainRemints(t *testing.T) {
 
 func TestDomainEnrolledAfterKeywordUsesIt(t *testing.T) {
 	s, _ := newTestStore(t)
-	kw, err := s.Enroll(KindProduct, "AcmeOnline", seedProv)
+	kw, err := s.seedEnroll(KindProduct, "AcmeOnline", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := s.Enroll(KindDomain, "login.ACMEONLINE-app.acme.pt", seedProv)
+	a, err := s.seedEnroll(KindDomain, "login.ACMEONLINE-app.acme.pt", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -704,11 +704,11 @@ func TestRemintHealsAfterFailure(t *testing.T) {
 	for _, heal := range []string{"reopen", "re-enroll"} {
 		t.Run(heal, func(t *testing.T) {
 			s, p := newTestStore(t)
-			if _, err := s.Enroll(KindDomain, "acmebank-vpn.acmebank.pt", seedProv); err != nil {
+			if _, err := s.seedEnroll(KindDomain, "acmebank-vpn.acmebank.pt", seedProv); err != nil {
 				t.Fatal(err)
 			}
 			p.failUpdates = 1
-			_, err := s.Enroll(KindOrg, "AcmeBank", seedProv)
+			_, err := s.seedEnroll(KindOrg, "AcmeBank", seedProv)
 			if err == nil {
 				t.Fatal("injected re-mint failure not reported")
 			}
@@ -725,7 +725,7 @@ func TestRemintHealsAfterFailure(t *testing.T) {
 				cur, err = OpenStore(p, testEncKey, testHMACKey)
 			case "re-enroll":
 				cur = s
-				_, err = s.Enroll(KindOrg, "acmebank", seedProv)
+				_, err = s.seedEnroll(KindOrg, "acmebank", seedProv)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -742,11 +742,11 @@ func TestRemintHealsAfterFailure(t *testing.T) {
 
 func TestOpenStoreFailsClosedOnSweepError(t *testing.T) {
 	s, p := newTestStore(t)
-	if _, err := s.Enroll(KindDomain, "acmebank-vpn.acmebank.pt", seedProv); err != nil {
+	if _, err := s.seedEnroll(KindDomain, "acmebank-vpn.acmebank.pt", seedProv); err != nil {
 		t.Fatal(err)
 	}
 	p.failUpdates = 1
-	if _, err := s.Enroll(KindOrg, "AcmeBank", seedProv); err == nil {
+	if _, err := s.seedEnroll(KindOrg, "AcmeBank", seedProv); err == nil {
 		t.Fatal("expected failure")
 	}
 	p.failUpdates = 1

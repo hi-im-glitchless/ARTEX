@@ -13,7 +13,7 @@ func TestShortCredentialsGluedToFlags(t *testing.T) {
 		k Kind
 		v string
 	}{{KindPassword, "abc123x"}, {KindPassword, "1234"}, {KindUsername, "bob"}} {
-		if _, err := s.Enroll(v.k, v.v, seedProv); err != nil {
+		if _, err := s.seedEnroll(v.k, v.v, seedProv); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -98,7 +98,7 @@ func TestDomainFileNamesRoundTrip(t *testing.T) {
 
 func TestPhoneVariants(t *testing.T) {
 	e, s := newTestEngine(t)
-	if _, err := s.Enroll(KindPhone, "+351912345678", seedProv); err != nil {
+	if _, err := s.seedEnroll(KindPhone, "+351912345678", seedProv); err != nil {
 		t.Fatal(err)
 	}
 	for _, in := range []string{

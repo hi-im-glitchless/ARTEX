@@ -45,7 +45,7 @@ func TestMembraneMissingOrWrongKeysWithEntries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Enroll(membrane.KindDomain, "t-membrane-keys.com", membrane.Provenance{Source: "seed"}); err != nil {
+	if _, err := st.EnrollRoot("t-membrane-keys.com", membrane.Provenance{Source: "seed"}); err != nil {
 		t.Fatal(err)
 	}
 

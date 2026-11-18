@@ -28,7 +28,7 @@ func newTestEngine(t *testing.T) (*Engine, *Store) {
 		{KindUsername, "jsilva"},
 		{KindPassword, "Hunter2024!"},
 	} {
-		if _, err := s.Enroll(e.k, e.v, seedProv); err != nil {
+		if _, err := s.seedEnroll(e.k, e.v, seedProv); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -99,7 +99,7 @@ func TestRoundTripFixture(t *testing.T) {
 func TestKindConfusion(t *testing.T) {
 	e, s := newTestEngine(t)
 	const key = "sk_live_51HxAbCdEfGh"
-	if _, err := s.Enroll(KindToken, key, seedProv); err != nil {
+	if _, err := s.seedEnroll(KindToken, key, seedProv); err != nil {
 		t.Fatal(err)
 	}
 	in := `{"username":"svc","password":"` + key + `"}`
@@ -286,7 +286,7 @@ func TestRealAliasShapedValueEnrolled(t *testing.T) {
 		t.Fatalf("got %q (unresolved %v) via %q", back, unresolved, out)
 	}
 	// Minted aliases already in the input pass through unchanged.
-	if _, err := s.Enroll(KindEmail, "joao.x@acmebank.pt", seedProv); err != nil {
+	if _, err := s.seedEnroll(KindEmail, "joao.x@acmebank.pt", seedProv); err != nil {
 		t.Fatal(err)
 	}
 	ra := mustAlias(t, s, "acmebank.pt")
@@ -299,7 +299,7 @@ func TestRealAliasShapedValueEnrolled(t *testing.T) {
 func TestMultiEncodingSecret(t *testing.T) {
 	e, s := newTestEngine(t)
 	const secret = "s3cr3t@Vault9"
-	if _, err := s.Enroll(KindPassword, secret, seedProv); err != nil {
+	if _, err := s.seedEnroll(KindPassword, secret, seedProv); err != nil {
 		t.Fatal(err)
 	}
 	basic := base64.StdEncoding.EncodeToString([]byte("svc:" + secret))
@@ -531,7 +531,7 @@ func TestLeakCheckIgnoresOriginalsInsideAliases(t *testing.T) {
 	e, s := newTestEngine(t)
 	ra := mustAlias(t, s, "acmebank.pt")
 	short := ra[1:4] // a 3-char original that happens to occur inside the alias
-	if _, err := s.Enroll(KindUsername, short, seedProv); err != nil {
+	if _, err := s.seedEnroll(KindUsername, short, seedProv); err != nil {
 		t.Fatal(err)
 	}
 	if hits := e.LeakCheck([]byte(`{"t":"see portal.` + ra + `"}`)); len(hits) != 0 {
@@ -734,7 +734,7 @@ func TestHostLabelsCarryingLiteralsAreAliased(t *testing.T) {
 	}
 	// Host enrolled before the username: re-minted when the username is.
 	out = toModel(t, e, "box mfaria-pc.acmebank.pt")
-	if _, err := s.Enroll(KindUsername, "mfaria", seedProv); err != nil {
+	if _, err := s.seedEnroll(KindUsername, "mfaria", seedProv); err != nil {
 		t.Fatal(err)
 	}
 	out2 := toModel(t, e, "box mfaria-pc.acmebank.pt")
@@ -748,7 +748,7 @@ func TestHostLabelsCarryingLiteralsAreAliased(t *testing.T) {
 
 func TestSubdomainLabelsContainingRootAreAliased(t *testing.T) {
 	e, s := newTestEngine(t)
-	if _, err := s.Enroll(KindDomain, "corpx.io", seedProv); err != nil { // no keyword covers it
+	if _, err := s.seedEnroll(KindDomain, "corpx.io", seedProv); err != nil { // no keyword covers it
 		t.Fatal(err)
 	}
 	in := "internal host corpx.io.internal.corpx.io is up"

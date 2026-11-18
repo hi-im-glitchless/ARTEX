@@ -27,7 +27,7 @@ func TestOpenStoreRealDBRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sub, err := s.Enroll(KindDomain, "portal.acmebank.pt", seedProv)
+	sub, err := s.seedEnroll(KindDomain, "portal.acmebank.pt", seedProv)
 	if err != nil {
 		t.Fatal(err)
 	}

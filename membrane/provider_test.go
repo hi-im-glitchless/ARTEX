@@ -250,7 +250,7 @@ func TestStreamAliasSplitAcrossDeltas(t *testing.T) {
 func TestStreamLongTokensAndDelimitedAliases(t *testing.T) {
 	e, s := newTestEngine(t)
 	const pw = "open sesame, (please) [now] 99"
-	if _, err := s.Enroll(KindPassword, pw, seedProv); err != nil {
+	if _, err := s.seedEnroll(KindPassword, pw, seedProv); err != nil {
 		t.Fatal(err)
 	}
 	pwAlias := mustAlias(t, s, pw)

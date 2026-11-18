@@ -164,7 +164,7 @@ func newTestEngine(t *testing.T) (*membrane.Engine, *membrane.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Enroll(membrane.KindDomain, "acmebank.com", membrane.Provenance{Source: "seed"}); err != nil {
+	if _, err := s.EnrollRoot("acmebank.com", membrane.Provenance{Source: "seed"}); err != nil {
 		t.Fatal(err)
 	}
 	return membrane.NewEngine(s, nil), s

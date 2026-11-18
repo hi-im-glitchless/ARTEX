@@ -231,3 +231,57 @@ func TestMembraneSyncCompanyProvenancePurge(t *testing.T) {
 		t.Fatal("company purge left the auto-enrolled entry")
 	}
 }
+
+// Task 9 fix C1/I1: a scope host on a third-party root (acme.okta.com) does
+// not make okta.com a client root; only the tenant label is aliased.
+func TestMembraneSyncThirdPartyRoot(t *testing.T) {
+	f := newSeedFixture(t)
+	pg := f.m.pg
+	if _, _, invalid, errs := pg.Companies().AddScopeInputs(f.cid, []db.ScopeInput{{Kind: "domain", Value: "acme.okta.com"}}, "t"); invalid > 0 {
+		t.Fatalf("company scope: %v", errs)
+	}
+	if _, err := pg.Assets().AddAgentScope(f.taskID, "subdomain", "acmeprod.okta.com", "", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pg.UpsertTaskCredential(f.taskID, db.TaskCredentialInput{
+		Domain: "https://login.okta.com/app", Username: "svc-acme", Password: "Okta-pw-77", Source: "user",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.SyncTask(context.Background(), f.id()); err != nil {
+		t.Fatal(err)
+	}
+	st, e := f.s.membraneStore(), f.s.membraneEngine()
+	if st.HasRoot("okta.com") || slices.Contains(st.Roots(), "okta.com") {
+		t.Fatal("okta.com became a client root")
+	}
+	if _, _, ok := st.AliasFor("okta.com"); ok {
+		t.Fatal("okta.com enrolled")
+	}
+	if _, _, ok := st.AliasFor("okta"); ok {
+		t.Fatal("brand variant of a third-party root enrolled (I1)")
+	}
+	for _, v := range []string{"acme", "acmeprod"} {
+		if _, _, ok := st.AliasFor(v); !ok {
+			t.Fatalf("tenant label (len %d) not aliased", len(v))
+		}
+	}
+	if !st.HasRoot("acmebank.pt") {
+		t.Fatal("declared root missing")
+	}
+	out, _, err := e.ToModel("Okta SSO at https://acme.okta.com and https://acmeprod.okta.com, IdP https://login.okta.com", membrane.Provenance{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Okta SSO") || !strings.Contains(out, "login.okta.com") ||
+		strings.Contains(out, "acme.okta") || strings.Contains(out, "acmeprod") {
+		t.Fatalf("model view = %q", out)
+	}
+	for _, r := range st.Roots() {
+		ra, _, _ := st.AliasFor(r)
+		back, _ := e.ToReal("subfinder -d " + ra + "; curl https://x." + ra + "/")
+		if strings.Contains(back, "okta.com") {
+			t.Fatalf("derivation produced a third-party host: %q", back)
+		}
+	}
+}

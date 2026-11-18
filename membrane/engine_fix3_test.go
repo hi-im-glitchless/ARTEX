@@ -31,6 +31,11 @@ func TestAliasNotReversedIntoThirdPartyHost(t *testing.T) {
 func TestNewRootRemintsHostsCarryingIt(t *testing.T) {
 	e, s := newTestEngine(t)
 	old := toModel(t, e, "host k.pt.acmebank.pt up") // minted before k.pt is a root
+	// An email alone no longer makes its domain a client root (Task 9 C1);
+	// the seeder opts the root in.
+	if _, err := s.EnrollRoot("k.pt", seedProv); err != nil {
+		t.Fatal(err)
+	}
 	in := "host k.pt.acmebank.pt up, mail 0@k.pt"
 	out := toModel(t, e, in)
 	if hits := e.LeakCheck([]byte(out)); len(hits) != 0 || strings.Contains(out, "k.pt") {
@@ -42,7 +47,6 @@ func TestNewRootRemintsHostsCarryingIt(t *testing.T) {
 	if back, _ := e.ToReal(old); back != "host k.pt.acmebank.pt up" {
 		t.Fatalf("retired alias must still resolve: %q", back)
 	}
-	_ = s
 }
 
 func TestKeptSpansNotRewritten(t *testing.T) {
@@ -51,10 +55,10 @@ func TestKeptSpansNotRewritten(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Enroll(KindPassword, "240", seedProv); err != nil {
+	if _, err := s.seedEnroll(KindPassword, "240", seedProv); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Enroll(KindPassword, "1234", seedProv); err != nil {
+	if _, err := s.seedEnroll(KindPassword, "1234", seedProv); err != nil {
 		t.Fatal(err)
 	}
 	for _, in := range []string{

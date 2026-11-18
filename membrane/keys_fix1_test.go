@@ -10,7 +10,7 @@ import (
 
 func TestOpenStoreWrongKeyIsKeyMismatch(t *testing.T) {
 	s, p := newTestStore(t)
-	if _, err := s.Enroll(KindPassword, "hunter2!", seedProv); err != nil {
+	if _, err := s.seedEnroll(KindPassword, "hunter2!", seedProv); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := OpenStore(p, bytes.Repeat([]byte{0x33}, 32), testHMACKey); !errors.Is(err, ErrKeyMismatch) {

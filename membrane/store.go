@@ -481,8 +481,50 @@ func (s *Store) deriverFor(attempt int) *Deriver {
 func (s *Store) Enroll(kind Kind, original string, prov Provenance) (string, error) {
 	s.enrollMu.Lock()
 	defer s.enrollMu.Unlock()
-	return s.enrollLocked(kind, original, prov, false)
+	return s.enrollLocked(kind, original, prov, enrolPlain)
 }
+
+// ErrNotClientRoot is returned when a domain (or an email's domain) would
+// need a root that is not enrolled: Enroll never makes a new client root
+// implicitly, because a third-party root (okta.com under acme.okta.com)
+// would then let derivation map the model's hosts onto other tenants. Roots
+// are opted in with EnrollRoot. Callers treat it as "not client space".
+var ErrNotClientRoot = errors.New("membrane: domain is not under an enrolled client root")
+
+// EnrollRoot enrols root (a registrable domain, eTLD+1) as a client root and
+// returns its alias. Only the seeder calls it, for roots the operator
+// declared or whose label carries a client keyword.
+func (s *Store) EnrollRoot(root string, prov Provenance) (string, error) {
+	norm, err := normDomain(root)
+	if err != nil {
+		return "", fmt.Errorf("membrane enroll root: %w", err)
+	}
+	if !isRootDomain(norm) {
+		return "", errors.New("membrane enroll root: not a registrable domain")
+	}
+	s.enrollMu.Lock()
+	defer s.enrollMu.Unlock()
+	return s.enrollLocked(KindDomain, norm, prov, enrolRoot)
+}
+
+// HasRoot reports whether root is an enrolled client root.
+func (s *Store) HasRoot(root string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.isRootLocked(strings.ToLower(root))
+}
+
+// enrolMode selects what an enrolment may create: enrolPlain never mints a
+// new root, enrolRoot may (EnrollRoot), enrolLookalike may and also enrols
+// alias-shaped real values (ruling R11: a real <hex6>.example host must be
+// aliased whatever its root).
+type enrolMode int
+
+const (
+	enrolPlain enrolMode = iota
+	enrolRoot
+	enrolLookalike
+)
 
 // enrollLookalike enrols a real value that is shaped like an alias (a
 // 240/4 or 2001:db8::/32 address, a host under .example) and that the store
@@ -492,10 +534,11 @@ func (s *Store) Enroll(kind Kind, original string, prov Provenance) (string, err
 func (s *Store) enrollLookalike(kind Kind, original string, prov Provenance) (string, error) {
 	s.enrollMu.Lock()
 	defer s.enrollMu.Unlock()
-	return s.enrollLocked(kind, original, prov, true)
+	return s.enrollLocked(kind, original, prov, enrolLookalike)
 }
 
-func (s *Store) enrollLocked(kind Kind, original string, prov Provenance, look bool) (string, error) {
+func (s *Store) enrollLocked(kind Kind, original string, prov Provenance, mode enrolMode) (string, error) {
+	look := mode == enrolLookalike
 	norm, stored, err := normalise(kind, original)
 	if err != nil {
 		return "", fmt.Errorf("membrane enroll: %w", err)
@@ -538,7 +581,7 @@ func (s *Store) enrollLocked(kind Kind, original string, prov Provenance, look b
 	mac := s.indexHMAC(kind, norm)
 	reloaded := false
 	for attempt := 0; attempt < maxMintAttempt; attempt++ {
-		alias, err := s.mint(kind, norm, stored, attempt, prov, look)
+		alias, err := s.mint(kind, norm, stored, attempt, prov, mode)
 		if err != nil {
 			return "", fmt.Errorf("membrane enroll %s: %w", kind, err)
 		}
@@ -647,12 +690,12 @@ func containsAll(have, want []int64) bool {
 }
 
 // mint derives the candidate alias for attempt. Caller holds enrollMu.
-func (s *Store) mint(kind Kind, norm, stored string, attempt int, prov Provenance, look bool) (string, error) {
+func (s *Store) mint(kind Kind, norm, stored string, attempt int, prov Provenance, mode enrolMode) (string, error) {
 	switch kind {
 	case KindDomain:
-		return s.mintDomain(norm, attempt, prov, look)
+		return s.mintDomain(norm, attempt, prov, mode)
 	case KindEmail:
-		return s.mintEmail(norm, attempt, prov, look)
+		return s.mintEmail(norm, attempt, prov, mode)
 	case KindOrg, KindProduct, KindPerson:
 		return s.keywordAlias(kind, norm, attempt), nil
 	case KindPrivateKey:
@@ -756,9 +799,13 @@ func (s *Store) remintForKeyword(keyword string) error {
 		if i < 0 || j < 0 {
 			continue
 		}
-		da, _, ok := s.AliasFor(e.norm[j+1:])
+		dom := e.norm[j+1:]
+		da, _, ok := s.AliasFor(dom)
 		if !ok {
-			continue
+			if r, err := publicsuffix.EffectiveTLDPlusOne(dom); err != nil || s.HasRoot(r) || freeMailDomains[dom] {
+				continue
+			}
+			da = replaceLiterals(s.Dictionary(), dom) // third-party domain kept (ErrNotClientRoot)
 		}
 		if err := s.retireAlias(e, e.alias[:i+1]+da); err != nil {
 			return err
@@ -798,12 +845,15 @@ func (s *Store) retireAlias(e *entry, newAlias string) error {
 	return nil
 }
 
-func (s *Store) mintDomain(norm string, attempt int, prov Provenance, look bool) (string, error) {
+func (s *Store) mintDomain(norm string, attempt int, prov Provenance, mode enrolMode) (string, error) {
 	root, err := publicsuffix.EffectiveTLDPlusOne(norm)
 	if err != nil {
 		return "", errors.New("domain has no registrable root") // library error embeds the input
 	}
 	if root == norm {
+		if mode == enrolPlain {
+			return "", ErrNotClientRoot
+		}
 		if attempt == 0 {
 			return s.deriver.RootDomain(norm), nil
 		}
@@ -812,7 +862,7 @@ func (s *Store) mintDomain(norm string, attempt int, prov Provenance, look bool)
 	if attempt > 0 {
 		return "", errors.New("subdomain alias collision")
 	}
-	rootAlias, err := s.enrollLocked(KindDomain, root, prov, look)
+	rootAlias, err := s.enrollLocked(KindDomain, root, prov, mode)
 	if err != nil {
 		return "", err
 	}
@@ -847,7 +897,7 @@ func replaceLiterals(dict *Automaton, prefix string) string {
 	return b.String()
 }
 
-func (s *Store) mintEmail(norm string, attempt int, prov Provenance, look bool) (string, error) {
+func (s *Store) mintEmail(norm string, attempt int, prov Provenance, mode enrolMode) (string, error) {
 	i := strings.LastIndexByte(norm, '@')
 	local, dom := norm[:i], norm[i+1:]
 	if attempt > 0 {
@@ -857,7 +907,13 @@ func (s *Store) mintEmail(norm string, attempt int, prov Provenance, look bool) 
 	if freeMailDomains[dom] {
 		return "u-" + strings.TrimPrefix(la, "user-") + "@" + dom, nil
 	}
-	da, err := s.enrollLocked(KindDomain, dom, prov, look)
+	da, err := s.enrollLocked(KindDomain, dom, prov, mode)
+	if errors.Is(err, ErrNotClientRoot) {
+		// Not client space: like a free-mail domain, the domain stays (with
+		// any client literal in its labels replaced); only the local part,
+		// personal data whatever the domain, is aliased.
+		return la + "@" + replaceLiterals(s.Dictionary(), dom), nil
+	}
 	if err != nil {
 		return "", err
 	}
