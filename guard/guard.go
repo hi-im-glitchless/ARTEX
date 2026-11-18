@@ -34,7 +34,16 @@ type Guard struct {
 	attrib      map[string]int // failure attribution counts (Observer / G5)
 	reg         *hook.Registry
 	interceptor *intercept.Interceptor // optional; nil disables user-configured rules
+	// membraneCheck is the identity membrane's tool rule (spec §9.2/§9.3):
+	// unresolved aliases, and client originals in web_search queries. It runs
+	// before everything else in preToolUse. nil when the membrane is off.
+	membraneCheck MembraneCheck
 }
+
+// MembraneCheck inspects a tool call's (already de-aliased) input and
+// reports whether it must be blocked, with the model-facing reason. The
+// reason must never contain a client original.
+type MembraneCheck func(tool string, input []byte) (block bool, reason string)
 
 // New creates a Guard without user-configured intercept rules (used for pentest
 // tasks where the Interceptor is not yet available).
@@ -51,10 +60,21 @@ func newGuard(ic *intercept.Interceptor) *Guard {
 	return g
 }
 
+// SetMembraneCheck installs (or, with nil, removes) the membrane tool check.
+// Safe to call while the guard is in use.
+func (g *Guard) SetMembraneCheck(fn MembraneCheck) {
+	g.mu.Lock()
+	g.membraneCheck = fn
+	g.mu.Unlock()
+}
+
 // Hooks returns the hook registry to attach to an agent session.
 func (g *Guard) Hooks() *hook.Registry { return g.reg }
 
 func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
+	g.mu.Lock()
+	check := g.membraneCheck
+	g.mu.Unlock()
 	// Extract the shell-command surface for the audit log: Bash + the interactive-shell
 	// tools (shell_open's command, shell_send's text). Destructive/exfil gating is no
 	// longer hard-coded here — it now lives in the DB intercept rules, evaluated by
@@ -73,6 +93,15 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 		}
 		_ = json.Unmarshal(ev.Input, &in)
 		cmd = in.Text
+	}
+	// Membrane first: a call carrying an invented alias or (web_search) a
+	// client original never reaches the intercept rules or the tool. The
+	// reason goes to the model verbatim (it is not a platform-policy block
+	// the agent should route around, but a name it must correct).
+	if check != nil {
+		if block, reason := check(ev.ToolName, ev.Input); block {
+			return g.block(ev.ToolName, reason, cmd)
+		}
 	}
 	g.record(ev.ToolName, "allow", "", cmd)
 	return g.applyIntercept(ctx, ev)

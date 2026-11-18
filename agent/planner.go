@@ -10,6 +10,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
+	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -39,6 +40,7 @@ type Planner struct {
 	noaEnabledFn      func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
 	compactor         *Compactor                             // cold-node compaction (§7); nil = disabled
+	hooks             harness.HookRunner                     // tool hooks (membrane tool check); nil = none
 	// lessonsBlock is the code-owned RSI evidence block appended after the
 	// rendered system prompt. Empty = off. Rendered by the server as data.
 	lessonsBlock string
@@ -457,6 +459,9 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		Settlement:   settle,
 		NonStreaming: p.nonStreaming(), // when this profile selects non-streaming, use Provider.Complete
 		MaxTokens:    p.maxTokens(),    // 0 = send no cap; the server default decides
+	}
+	if p.hooks != nil {
+		opts.Hooks = p.hooks
 	}
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx

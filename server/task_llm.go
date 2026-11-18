@@ -711,6 +711,9 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	// (agentsForTask) is exactly what the engine actually drives through the authoritative
 	// resolver, so the Compactor must hook in here. The planner provider goes through task routing (§4: same model as the agent, resolved with the task's LLM chain); compaction uses Complete to generate the body in one shot.
 	pl.SetCompactor(agent.NewCompactor(plannerRuntime, "task-router"))
+	// The planner and main agent run tools (Bash, web_search) without the task
+	// guard; they still get the membrane tool check (spec §9.2/§9.3).
+	pl.SetToolHooks(s.membraneToolHooks(t.ID, "planner", plannerRuntime.membraned))
 	// RSI shadow mode: select evidence-backed lessons for this task. Off by
 	// default; shadow logs what would be shown, inject appends the block.
 	s.wireTaskLessons(t, wk, pl)
@@ -723,6 +726,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	main.SetWebSearch(s.webSearchFor("mainagent"))
 	main.SetSteerWork(s.engine.SteerWork) // steer_work: real-time course correction on running work by a human
+	main.SetToolHooks(s.membraneToolHooks(t.ID, "mainagent", mainRuntime.membraned))
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
 		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,

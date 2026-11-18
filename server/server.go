@@ -21,6 +21,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
@@ -154,6 +155,12 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initMembrane(keyDir) // before any provider is built
+	// Task worker guards get the membrane tool check (spec §9.2/§9.3); set
+	// before restoreTaskRuntimes loads the persisted tasks.
+	m.membraneCheckFor = func(taskID string) guard.MembraneCheck {
+		rt := &taskLLMRuntime{s: s, taskID: taskID, agentKey: "worker"}
+		return s.membraneToolCheck(taskID, "worker", rt.membraned)
+	}
 	// In the background: every task re-syncs before its requests anyway.
 	// Errors are logged and shown in membraneStatus.
 	if ctx.Err() == nil {
@@ -483,7 +490,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	s.chatAgent = agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win) // chat page runner
 	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	s.chatAgent.SetWebSearch(s.m.WebSearchOpts())
-	s.chatAgent.SetGuard(s.chatGuard())
+	s.chatAgent.SetGuard(s.chatGuard(prov, cfg))
 	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
 	s.chatAgent.SetMaxTokens(maxTokensResolver(cfg))
 	s.chatAgent.SetNoaEnabled(s.m.NoaCompactionEnabled) // experimental: noa context compaction (read per run)
@@ -625,7 +632,7 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
 	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	ca.SetWebSearch(s.m.WebSearchOpts())
-	ca.SetGuard(s.chatGuard())
+	ca.SetGuard(s.chatGuard(s.poolForBinding(id, prov, cfg), cfg))
 	ca.SetNonStreaming(nonStreamingResolver(cfg))
 	ca.SetMaxTokens(maxTokensResolver(cfg))
 	ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // experimental: noa context compaction (read per run)
