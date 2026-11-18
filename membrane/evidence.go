@@ -39,7 +39,10 @@ var LimitsText = []string{
 	"Arbitrary base64/hex blobs, signed cookies and compressed data are not decoded. Values hidden inside them are only caught when the whole blob is a known secret (it is then replaced as an opaque fake). URL encoding, JSON \\u escapes, HTML entities, Authorization: Basic credentials and JWT header/payload segments are decoded and checked.",
 	"Non-LLM egress (notifications, remote MCP servers, enrichment probes) is not membraned in v1.",
 	"Local transcripts and database rows that already hold real data are not encrypted by the membrane.",
-	"Profiles marked trusted (local models) skip the membrane; their records carry no membrane hash, are listed as unmembraned and are not verified.",
+	"Trust is derived from a profile's base URL, not set: a literal loopback, RFC 1918 or ULA IP, or \"localhost\", is a trusted local endpoint and skips the membrane; its records carry no membrane hash, are listed as unmembraned and are not verified. A gateway on such an address (LiteLLM, one-api) that forwards to a remote provider is still treated as local, so the remote provider receives real values: address the gateway by a host name (not localhost and not a private IP literal) to keep the membrane on. A local profile with an explicit proxy sends the real request bodies to that proxy.",
+	"Client domains and email domains nobody declared (a secondary domain of the client, the mail domain of its staff) are not aliased unless their registrable label carries a declared client keyword or brand variant: their host names keep the domain in clear, and an email address under them gets an aliased local part but keeps its domain.",
+	"Brand names are matched as written: a name split across a line break (\"Acme\\nBank\") or by an unusual separator (\"Acme·Bank\", \"A.C.M.E\") is not matched by its declared spellings.",
+	"Format-preserving aliases (passwords, usernames, tokens, phone numbers) replace ASCII letters and digits only: non-ASCII letters (ñ, é, ç, CJK) and punctuation are kept verbatim inside the alias, so they show through.",
 }
 
 // ExcerptsNote explains why the export carries no model-view excerpts

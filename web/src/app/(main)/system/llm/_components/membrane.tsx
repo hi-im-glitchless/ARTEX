@@ -17,7 +17,7 @@ export function ProfileMembraneBadge({ profile, status }: { profile: LLMProfile;
       <Badge
         variant="outline"
         className="border-sky-500/50 text-sky-700 dark:text-sky-300"
-        title="Local endpoint (loopback / private IP / localhost): requests carry real values and are not membraned"
+        title="Local endpoint (loopback / private IP / localhost): requests carry real values and are not membraned. A local gateway (LiteLLM, one-api) that forwards to a remote provider sends that provider real data too: address it by a host name to keep the membrane on. A proxy set on this profile also receives the real requests."
       >
         trusted local
       </Badge>
