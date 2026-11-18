@@ -172,6 +172,10 @@ var (
 	wrappers      = map[string]wrapper{
 		"sudo": {argOpts: "ugpChDrtUT", argLong: map[string]bool{"--user": true, "--group": true}},
 		"exec": {}, "time": {}, "nohup": {}, "command": {}, "builtin": {}, "doas": {argOpts: "uC"},
+		"do": {}, "then": {}, "else": {}, "elif": {}, "{": {}, "!": {},
+		"--": {}, // mysql> ... -- mysql -p...: read rather than guess
+
+		"strace": {argOpts: "abeEIoOpPsSuX"}, "ltrace": {argOpts: "aAeEnoOpPsSuxX"},
 		"env":     {argOpts: "uCS", argLong: map[string]bool{"--unset": true, "--chdir": true}},
 		"nice":    {argOpts: "n"},
 		"ionice":  {argOpts: "cnp"},
@@ -208,7 +212,18 @@ func words(text string, s, e int) [][2]int {
 
 // skipOptions skips a wrapper's options (with their arguments) and its
 // operands from word k on, and returns the index of the next word.
+// Options may also follow the operands (ssh HOST -p2222 cmd), so they are
+// skipped again after them.
 func skipOptions(text string, toks [][2]int, k int, w wrapper) int {
+	k = skipFlags(text, toks, k, w)
+	if w.operands == 0 || k >= len(toks) {
+		return k
+	}
+	return skipFlags(text, toks, min(k+w.operands, len(toks)), w)
+}
+
+// skipFlags skips options (with their arguments) from word k on.
+func skipFlags(text string, toks [][2]int, k int, w wrapper) int {
 	for k < len(toks) {
 		tok := text[toks[k][0]:toks[k][1]]
 		if tok == "--" {
@@ -228,7 +243,7 @@ func skipOptions(text string, toks [][2]int, k int, w wrapper) int {
 			k++ // -u user, -n 10
 		}
 	}
-	return min(k+w.operands, len(toks))
+	return k
 }
 
 // afterDashDash returns the index after the first "--" word from k on, or
@@ -331,7 +346,7 @@ func lineHasAny(text string, anchors ...string) func(s, e int) bool {
 
 // Key-name rules ported from middlehack redactor.py.
 var (
-	passwordKeyRE = regexp.MustCompile(`(?i)(passw(or)?d|passwd|pass\b|pwd)`)
+	passwordKeyRE = regexp.MustCompile(`(?i)(passw(or)?d|passwd|pass\b|pwd|passphrase|passcode)`)
 	emailKeyRE    = regexp.MustCompile(`(?i)(e-?mail)`)
 	usernameKeyRE = regexp.MustCompile(`(?i)(username|user|login|account|usr)`)
 	// secretKeyRE is SECRET_KEY_RE with "auth(?!or)" written as "auth"; the
@@ -363,7 +378,102 @@ var keyAnchors = []string{"pass", "pwd", "mail", "user", "login", "account", "us
 
 // keyKind classifies a field name. Email keys yield nothing: the email
 // detector handles the value by shape.
+//
+// A compound name (auth_type, tokenTtl, --user-namespace) is a credential
+// only through its last credential component, and only when no qualifier
+// follows it: auth_type, token_type, secret-name, user-pool-id and
+// api-key-header name a setting, not a secret, and their values (basic,
+// bearer, prod-db) must not be enrolled. Other followers keep it a
+// credential (db_password_prod). "key" counts only after api, access,
+// secret, private, signing, client, master, encryption, auth, consumer or
+// app (ssh-key, public_key and key_id are not secrets); "id" only after
+// session (session_id).
 func keyKind(key string) (Kind, bool) {
+	comps := keyComponents(key)
+	if len(comps) < 2 {
+		return keyKindWord(key)
+	}
+	for i := len(comps) - 1; i >= 0; i-- {
+		c := comps[i]
+		var k Kind
+		ok := false
+		switch {
+		case c == "key" || c == "keys":
+			if i > 0 && keyPrefixes[comps[i-1]] {
+				k, ok = KindToken, true
+			}
+		case c == "id" && i > 0 && (comps[i-1] == "session" || comps[i-1] == "sess"):
+			k, ok = KindToken, true
+		case keyQualifiers[c]:
+		default:
+			if emailKeyRE.MatchString(c) {
+				return "", false
+			}
+			k, ok = keyKindWord(c)
+		}
+		if !ok {
+			continue
+		}
+		for _, f := range comps[i+1:] {
+			if keyQualifiers[f] {
+				return "", false
+			}
+		}
+		return k, true
+	}
+	return "", false
+}
+
+// keyComponents splits a field name at '-', '_', '.', and lower-to-upper
+// camelCase boundaries, lowercased: AWS_SECRET_ACCESS_KEY -> aws secret
+// access key, apiKey -> api key, --user-pool-id -> user pool id.
+func keyComponents(key string) []string {
+	var out []string
+	start := 0
+	flush := func(e int) {
+		if e > start {
+			out = append(out, lowerASCII(key[start:e]))
+		}
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		switch {
+		case c == '-' || c == '_' || c == '.' || c == '[' || c == ']':
+			flush(i)
+			start = i + 1
+		case c >= 'A' && c <= 'Z' && i > start && key[i-1] >= 'a' && key[i-1] <= 'z':
+			flush(i)
+			start = i
+		}
+	}
+	flush(len(key))
+	return out
+}
+
+// keyPrefixes make a following "key" component a secret key.
+var keyPrefixes = map[string]bool{
+	"api": true, "access": true, "secret": true, "private": true, "signing": true, "client": true,
+	"master": true, "encryption": true, "auth": true, "consumer": true, "app": true,
+}
+
+// keyQualifiers: components that turn a credential name into the name of a
+// setting about it (auth_type, token_ttl, secret_name, user_namespace).
+var keyQualifiers = map[string]bool{
+	"type": true, "types": true, "mode": true, "ttl": true, "name": true, "names": true, "id": true, "ids": true,
+	"ref": true, "policy": true, "endpoint": true, "url": true, "uri": true, "namespace": true, "ns": true,
+	"audience": true, "provider": true, "attribute": true, "attr": true, "header": true, "pool": true,
+	"method": true, "methods": true, "file": true, "path": true, "dir": true, "store": true, "agent": true,
+	"data": true, "arn": true, "length": true, "len": true, "expiry": true, "expires": true, "expiration": true,
+	"lifetime": true, "timeout": true, "format": true, "scheme": true, "kind": true, "field": true,
+	"param": true, "prefix": true, "hint": true, "enabled": true, "required": true, "version": true,
+	"location": true, "issuer": true, "scope": true, "scopes": true, "strategy": true, "plugin": true,
+	"backend": true, "server": true, "host": true, "port": true, "level": true, "count": true, "ip": true,
+	"helper": true, "source": true, "class": true, "config": true, "manager": true, "group": true,
+	"role": true, "home": true, "shell": true, "uid": true, "gid": true,
+}
+
+// keyKindWord classifies one name by the middlehack substring rules.
+func keyKindWord(key string) (Kind, bool) {
 	low := lowerASCII(key)
 	hit := false
 	for _, a := range keyAnchors {
@@ -424,6 +534,14 @@ var placeholderWords = map[string]bool{
 	"example": true, "sample": true, "value": true, "redacted": true,
 	"hidden": true, "masked": true, "placeholder": true, "dummy": true, "todo": true,
 	"username": true, "user": true, "test": true, "empty": true,
+	// Protocol and configuration words that sit in auth settings
+	// (auth: basic, "token_type":"bearer", --auth-provider=oidc).
+	"basic": true, "bearer": true, "digest": true, "ntlm": true, "negotiate": true, "kerberos": true,
+	"oidc": true, "oauth": true, "oauth2": true, "saml": true, "ldap": true, "host": true, "md5": true,
+	"scram-sha-256": true, "trust": true, "peer": true, "yes": true, "no": true, "on": true, "off": true,
+	"enabled": true, "disabled": true, "required": true, "optional": true,
+	// Service accounts: not client-identifying (--user=www-data).
+	"www-data": true, "nobody": true, "daemon": true, "nginx": true, "apache": true,
 }
 
 // placeholderValue reports a value that is a template or placeholder, not a
@@ -861,6 +979,7 @@ var spaceOptNames = map[string]bool{
 	"login": true, "token": true, "api-key": true, "api_key": true, "apikey": true, "secret": true,
 	"client-secret": true, "client_secret": true, "access-key": true, "secret-key": true,
 	"auth-token": true, "access-token": true, "db-password": true, "db-user": true,
+	"bearer": true, "oauth2-bearer": true, "passphrase": true, "bearer-token": true,
 }
 
 func optionSecrets(text string, out []Span) []Span {

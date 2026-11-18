@@ -208,7 +208,8 @@ func hostContinuation(t string, i int) (string, bool) {
 // encodedDots are spellings of '.' that a URL parser, HTML decoder, shell
 // or IDNA mapping turns into a dot, lowercase (matched case-insensitively).
 var encodedDots = []string{".", "%2e", "%252e", "&#46;", "&#046;", "&#x2e;", "&#x002e;", "\\.", "\\x2e", "\\u002e",
-	"\uff0e", "\u3002", "\uff61"}
+	"\uff0e", "\u3002", "\uff61", "%e3%80%82", "%ef%bc%8e", "%ef%bd%a1", "&period;", "&#12290;", "&#65294;",
+	"&#65377;", "&#x3002;", "&#xff0e;", "&#xff61;"}
 
 // dotLen returns the length of a dot spelling at t[i:], or 0.
 func dotLen(t string, i int) int {
