@@ -255,8 +255,26 @@ func (w *wrapped) prepare(ctx context.Context, req llm.CompletionRequest) (llm.C
 	if err != nil {
 		return llm.CompletionRequest{}, m, block("serialise failed", errors.New("membrane: request not sent: cannot serialise request"))
 	}
+	hits := w.e.LeakCheck(body)
+	if len(hits) > 0 && len(replay) > 0 {
+		// A value the model guessed in signed thinking may have been
+		// enrolled since (a tool result proved it real): the replayed
+		// alias-space text now carries an original. Drop those blocks
+		// rather than block every later request of the conversation.
+		var dropped bool
+		if out, dropped, err = w.dropLeakingThinking(out, replay, prov); err != nil {
+			return llm.CompletionRequest{}, m, block("transform failed", fmt.Errorf("membrane: request not sent: %w", err))
+		}
+		if dropped {
+			rep.Flags = unionSorted(rep.Flags, []string{"signed_thinking_dropped"})
+			if body, err = json.Marshal(out); err != nil {
+				return llm.CompletionRequest{}, m, block("serialise failed", errors.New("membrane: request not sent: cannot serialise request"))
+			}
+			hits = w.e.LeakCheck(body)
+		}
+	}
 	ev.Report = rep
-	if hits := w.e.LeakCheck(body); len(hits) > 0 {
+	if len(hits) > 0 {
 		return llm.CompletionRequest{}, m, block(leakReason(hits), ErrLeakBlocked)
 	}
 	sum := sha256.Sum256(body)
@@ -327,6 +345,50 @@ func (w *wrapped) stripSignedThinking(req llm.CompletionRequest) (llm.Completion
 		}
 	}
 	return req, rs
+}
+
+// dropLeakingThinking removes from out (in place: out shares nothing with
+// the caller's request) the replayed signed thinking blocks whose cached
+// text now holds an enrolled original. A message left without content gets
+// that text transformed, unsigned, as a text block. dropped reports whether
+// any block was removed.
+func (w *wrapped) dropLeakingThinking(out llm.CompletionRequest, replay []replayed, prov Provenance) (llm.CompletionRequest, bool, error) {
+	drop := map[int][]replayed{}
+	for _, r := range replay {
+		b, err := json.Marshal(r.text)
+		if err != nil || len(w.e.LeakCheck(b)) > 0 {
+			drop[r.msg] = append(drop[r.msg], r)
+		}
+	}
+	if len(drop) == 0 {
+		return out, false, nil
+	}
+	for i, rs := range drop {
+		c := out.Messages[i].Content
+		kept := make([]llm.ContentBlock, 0, len(c))
+		for j, b := range c {
+			if !slices.ContainsFunc(rs, func(r replayed) bool { return r.block == j }) {
+				kept = append(kept, b)
+			}
+		}
+		if len(kept) == 0 {
+			var text strings.Builder
+			for k, r := range rs {
+				if k > 0 {
+					text.WriteString("\n\n")
+				}
+				text.WriteString(r.text)
+			}
+			t, _, err := w.e.ToModelRequest(llm.CompletionRequest{Messages: []llm.Message{{Role: out.Messages[i].Role,
+				Content: []llm.ContentBlock{{Type: llm.BlockText, Text: text.String()}}}}}, prov)
+			if err != nil {
+				return out, false, err
+			}
+			kept = t.Messages[0].Content
+		}
+		out.Messages[i].Content = kept
+	}
+	return out, true, nil
 }
 
 // auditUnresolved records a "response" event when a reply carried
