@@ -16,7 +16,7 @@ func TestConfigFlagsNotCredentials(t *testing.T) {
 		"--secret-id=arn:aws:x", "--user-pool-id=eu_X1", "--api-key-header=X-Api-Key", "--token-endpoint=https://x/y",
 		"--user=www-data", "--auth-method=password", "--password-store=basic", "--user-data-dir=/tmp/x",
 		"--token-file=/var/run/token", "--passwd-file=/etc/p", "--token-auth-file=/x", "--secretsmanager-arn=x",
-		"curl --user-agent=Mozilla/5.0 x", "--passive=yes", "git config --user.name=Jose",
+		"curl --user-agent=Mozilla/5.0 x", "--passive=yes", // git user.name is a person name, detected since task 6 review
 		"kube-apiserver --authorization-mode=Node,RBAC --user-namespace=host --token-audience=api --auth-type=basic --token-type=bearer",
 		"auth_type=basic", `{"token_type":"bearer","expires_in":3600}`, "auth: basic",
 	} {

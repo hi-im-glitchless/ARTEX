@@ -29,7 +29,8 @@ func (secretDetector) Detect(text string) []Span {
 	out = userinfoSecrets(text, out)
 	out = optionSecrets(text, out)
 	out = append(out, gluedFlagSpans(text)...)
-	return out
+	out = gitNameSpans(text, out)
+	return settleUserIDs(out)
 }
 
 // Glued credential options: the MySQL client family takes -u<user> and
@@ -389,6 +390,9 @@ var keyAnchors = []string{"pass", "pwd", "mail", "user", "login", "account", "us
 // app (ssh-key, public_key and key_id are not secrets); "id" only after
 // session (session_id).
 func keyKind(key string) (Kind, bool) {
+	if lowerASCII(key) == "user.name" {
+		return KindPerson, true // git's display name, not a login
+	}
 	comps := keyComponents(key)
 	if len(comps) < 2 {
 		return keyKindWord(key)
@@ -419,9 +423,90 @@ func keyKind(key string) (Kind, bool) {
 				return "", false
 			}
 		}
+		if k == KindUsername && c != "id" && i == len(comps)-2 && comps[i+1] == "id" {
+			k = kindUserID // user_id: numeric values are not enrolled
+		}
 		return k, true
 	}
 	return "", false
+}
+
+// kindUserID is an internal kind for user_id-style keys. secretDetector
+// drops numeric values (1042 would alias every 1042 in the text) and turns
+// the rest into KindUsername.
+const kindUserID Kind = "userid"
+
+var numericIDRE = regexp.MustCompile(`^[0-9]+$`)
+
+func settleUserIDs(spans []Span) []Span {
+	out := spans[:0]
+	for _, sp := range spans {
+		if sp.Kind == kindUserID {
+			if numericIDRE.MatchString(sp.Value) || uidRE.MatchString(sp.Value) {
+				continue
+			}
+			sp.Kind = KindUsername
+		}
+		out = append(out, sp)
+	}
+	return out
+}
+
+// Git identity: `git config [opts] user.name <v>` and `name = <v>` inside a
+// [user] section. The key=value forms go through keyKind ("user.name").
+var gitNameRE = regexp.MustCompile(`(?:^|\s)user\.name[ \t]+` + quotedOr(`[^\s"'<>;|&()-][^\s"'<>;|&()]*`))
+
+func gitNameSpans(text string, out []Span) []Span {
+	if !strings.Contains(text, "name") {
+		return out
+	}
+	for _, m := range lineMatches(gitNameRE, text, lineHasAny(text, "user.name")) {
+		ls := strings.LastIndexByte(text[:m[0]], '\n') + 1
+		le := strings.IndexByte(text[m[0]:], '\n')
+		if le < 0 {
+			le = len(text)
+		} else {
+			le += m[0]
+		}
+		if line := text[ls:le]; !strings.Contains(line, "git") || !strings.Contains(line, "config") {
+			continue
+		}
+		if vs, ve := valueGroup(m, 1); vs >= 0 {
+			if sp, ok := valueSpan(text, vs, ve, KindPerson); ok {
+				out = append(out, sp)
+			}
+		}
+	}
+	// gitconfig sections.
+	inUser := false
+	for ls := 0; ls < len(text); {
+		le := strings.IndexByte(text[ls:], '\n')
+		if le < 0 {
+			le = len(text)
+		} else {
+			le += ls
+		}
+		line := strings.TrimSpace(text[ls:le])
+		switch {
+		case strings.HasPrefix(line, "["):
+			inUser = strings.EqualFold(line, "[user]")
+		case inUser:
+			if k, _, ok := strings.Cut(line, "="); ok && strings.EqualFold(strings.TrimSpace(k), "name") {
+				vs := ls + strings.Index(text[ls:le], "=") + 1
+				vs, ve := trimSpaces(text, vs, le)
+				if ve-vs >= 2 && (text[vs] == '"' || text[vs] == '\'') && text[ve-1] == text[vs] {
+					vs, ve = vs+1, ve-1
+				}
+				if vs < ve {
+					if sp, ok := valueSpan(text, vs, ve, KindPerson); ok {
+						out = append(out, sp)
+					}
+				}
+			}
+		}
+		ls = le + 1
+	}
+	return out
 }
 
 // qualifierExempt: a qualifier that does not turn the credential into a
