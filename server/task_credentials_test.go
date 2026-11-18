@@ -113,6 +113,39 @@ func TestTaskCredentialsFlow(t *testing.T) {
 	}
 }
 
+// Final review M3: invalid scope_keywords (too many, too long) are refused
+// with 400 before any task row is created.
+func TestCreateTaskScopeKeywordsValidatedFirst(t *testing.T) {
+	s, _, request := trafficEvidenceServer(t)
+	t.Cleanup(func() { // only reached on failure: a wrongly created task is removed
+		s.m.PG().Exec(`DELETE FROM membrane_entries WHERE task_ids && ARRAY(SELECT id FROM tasks WHERE description='scope keyword validation')::bigint[]`)
+		s.m.PG().Exec(`DELETE FROM tasks WHERE description='scope keyword validation'`)
+	})
+	count := func() int {
+		var n int
+		if err := s.m.PG().QueryRow(`SELECT count(*) FROM tasks`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	many := make([]string, 51)
+	for i := range many {
+		many[i] = fmt.Sprintf("term%d", i)
+	}
+	tooMany, _ := json.Marshal(many)
+	long, _ := json.Marshal([]string{strings.Repeat("k", 257)})
+	for name, kws := range map[string]string{"too many": string(tooMany), "too long": string(long)} {
+		before := count()
+		resp := request("POST", "/api/tasks", `{"description": "scope keyword validation", "goal": "Check the lab target at http://127.0.0.1:9/v1 for unauthenticated data exposure and record the outcome as evidence.", "scope_keywords": `+kws+`}`)
+		if resp.Code != http.StatusBadRequest {
+			t.Errorf("%s: HTTP %d %s, want 400", name, resp.Code, resp.Body.String())
+		}
+		if after := count(); after != before {
+			t.Errorf("%s: a task row was created (%d -> %d)", name, before, after)
+		}
+	}
+}
+
 // scope_keywords (the membrane preview's "Add as sensitive term") become
 // manual task-scope keyword rows before the task launches.
 func TestCreateTaskScopeKeywords(t *testing.T) {

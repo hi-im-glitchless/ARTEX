@@ -1610,6 +1610,17 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid task-level intercept rules: "+err.Error())
 		return
 	}
+	// Scope keywords are checked before the task row exists, so a bad list
+	// never leaves a task without its sensitive terms.
+	scopeKeywords, err := validateScopeKeywords(req.ScopeKeywords)
+	if err != nil {
+		writeErr(w, 400, "invalid scope keywords: "+err.Error())
+		return
+	}
+	if len(scopeKeywords) > 0 && s.m.Assets() == nil {
+		writeErr(w, 503, "asset store not enabled: scope keywords cannot be recorded")
+		return
+	}
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
 		Name: strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
@@ -1645,17 +1656,10 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if len(req.ScopeKeywords) > 0 {
+	if len(scopeKeywords) > 0 {
 		taskNum, _ := strconv.ParseInt(t.ID, 10, 64)
 		as := s.m.Assets()
-		if as == nil {
-			writeErr(w, 503, "asset store not enabled: scope keywords cannot be recorded")
-			return
-		}
-		for _, k := range req.ScopeKeywords {
-			if strings.TrimSpace(k) == "" {
-				continue
-			}
+		for _, k := range scopeKeywords {
 			if _, err := as.AddAgentScope(taskNum, "keyword", k, "sensitive term (membrane preview)", "manual"); err != nil {
 				writeErr(w, 400, "invalid scope keyword: "+err.Error())
 				return
@@ -1666,6 +1670,32 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	// launchTask is async internally and never blocks the UI — goal decomposition visibly proceeds in the background.
 	s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
 	writeJSON(w, 201, taskDTO(t, s.resolvedTaskStatus(t)))
+}
+
+// Bounds of createTask's scope_keywords.
+const (
+	maxScopeKeywords   = 50
+	maxScopeKeywordLen = 256
+)
+
+// validateScopeKeywords returns the non-blank keywords, trimmed, or an
+// error naming the bound exceeded (never the value).
+func validateScopeKeywords(in []string) ([]string, error) {
+	var out []string
+	for _, k := range in {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		if len(k) > maxScopeKeywordLen {
+			return nil, fmt.Errorf("a keyword is longer than %d bytes", maxScopeKeywordLen)
+		}
+		out = append(out, k)
+	}
+	if len(out) > maxScopeKeywords {
+		return nil, fmt.Errorf("at most %d keywords", maxScopeKeywords)
+	}
+	return out, nil
 }
 
 func (s *Server) validateTaskProfileIDs(ids []int64) error {
