@@ -103,8 +103,44 @@ func litTransform(lit string, t func(string) (string, error)) (string, error) {
 
 // ToModelJSON transforms the string values of a JSON document (keys and
 // non-string values are kept) and rewrites only the literals that changed.
-// Invalid JSON is transformed as plain text (fail safe).
+// Invalid JSON is transformed as plain text (fail safe). A pass that
+// enrolled anything is redone (see untilStable).
 func (e *Engine) ToModelJSON(raw json.RawMessage, prov Provenance) (json.RawMessage, Report, error) {
+	var out json.RawMessage
+	rep, err := e.untilStable(func() (Report, error) {
+		var r Report
+		var err error
+		out, r, err = e.toModelJSONOnce(raw, prov)
+		return r, err
+	})
+	if err != nil {
+		return nil, Report{}, err
+	}
+	return out, rep, nil
+}
+
+// untilStable runs pass until one leaves the table unchanged (at most
+// maxPasses). A value enrolled from a later string (a JSON literal, a later
+// message) must also be replaced in the strings already passed: an
+// alias-shaped real value is only replaced by lookalikes, which skip it
+// while it is not enrolled (guard block reasons). Enrolled sums all passes.
+func (e *Engine) untilStable(pass func() (Report, error)) (Report, error) {
+	enrolled := 0
+	for n := 1; ; n++ {
+		g := e.generation()
+		rep, err := pass()
+		if err != nil {
+			return Report{}, err
+		}
+		enrolled += rep.Enrolled
+		if e.generation() == g || n == maxPasses {
+			rep.Enrolled = enrolled
+			return rep, nil
+		}
+	}
+}
+
+func (e *Engine) toModelJSONOnce(raw json.RawMessage, prov Provenance) (json.RawMessage, Report, error) {
 	rep := newReport()
 	if len(raw) == 0 {
 		return raw, rep, nil
@@ -175,8 +211,23 @@ func appendNew(dst []string, src ...string) []string {
 // block's text, thinking, tool_use input and (recursively) tool_result
 // content. Tool definitions, ids, names and signatures are kept. The result
 // shares no slice with req. Signed thinking is transformed like any text;
-// replaying it byte-exact is the provider decorator's job (spec §8).
+// replaying it byte-exact is the provider decorator's job (spec §8). A pass
+// that enrolled anything is redone (see untilStable).
 func (e *Engine) ToModelRequest(req llm.CompletionRequest, prov Provenance) (llm.CompletionRequest, Report, error) {
+	var out llm.CompletionRequest
+	rep, err := e.untilStable(func() (Report, error) {
+		var r Report
+		var err error
+		out, r, err = e.toModelRequestOnce(req, prov)
+		return r, err
+	})
+	if err != nil {
+		return llm.CompletionRequest{}, Report{}, err
+	}
+	return out, rep, nil
+}
+
+func (e *Engine) toModelRequestOnce(req llm.CompletionRequest, prov Provenance) (llm.CompletionRequest, Report, error) {
 	rep := newReport()
 	out := req
 	out.System = nil
@@ -237,7 +288,7 @@ func (e *Engine) blocksToModel(bs []llm.ContentBlock, prov Provenance, assistant
 			return nil, err
 		}
 		if b.Input != nil {
-			in, r, err := e.ToModelJSON(b.Input, prov)
+			in, r, err := e.toModelJSONOnce(b.Input, prov)
 			if err != nil {
 				return nil, err
 			}

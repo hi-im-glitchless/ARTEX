@@ -191,9 +191,7 @@ func (e *Engine) transformPass(text string, prov Provenance, assistant bool) (st
 	var b strings.Builder
 	last := 0
 	extra := basicToModelCandidates(text)
-	if !assistant {
-		extra = append(extra, e.lookalikes(text)...)
-	}
+	extra = append(extra, e.lookalikes(text, assistant)...)
 	// Minted aliases already in the text are protected: no detection inside
 	// one is replaced (a short secret "240" inside the IP alias 240.0.1.7).
 	prot := e.mintedOccurrences(text)
@@ -509,16 +507,27 @@ func inHostToken(text string, s, e int) bool {
 // allocated block), passes through (ruling R5). A host whose suffix is a
 // minted domain alias is alias space whatever its labels (ruling R12):
 // never enrolled, never an error.
-func (e *Engine) lookalikes(text string) []tmCand {
+//
+// An enrolled real lookalike is replaced wherever it appears, assistant
+// text and guard block reasons included: the detectors skip the reserved
+// ranges, so this is its only replacement path. In assistant content
+// (assistant true) nothing new is enrolled (ruling R12): only enrolled
+// lookalikes become candidates.
+func (e *Engine) lookalikes(text string, assistant bool) []tmCand {
 	var out []tmCand
 	add := func(s, end int, k Kind) {
 		out = append(out, tmCand{Span: Span{Start: s, End: end, Kind: k, Value: text[s:end]}, look: true, added: true, prio: 1})
 	}
 	for _, sh := range scanShapes(text) {
-		// A token the tool guard rejected is an invented value, not a real
-		// one: it passes through unchanged (in this process via the rejected
-		// set; after a restart via the block reason around it).
-		if e.isRejected(sh.text) || inGuardReason(text, sh.Start, sh.End) {
+		if s, end, k, ok := e.enrolledLookalike(text, sh); ok {
+			add(s, end, k)
+			continue
+		}
+		// Not enrolled. In assistant content it is the model's own token; a
+		// token the tool guard rejected is an invented value. Both pass
+		// through unchanged (rejected: in this process via the set, after a
+		// restart via the block reason around it).
+		if assistant || e.isRejected(sh.text) || inGuardReason(text, sh.Start, sh.End) {
 			continue
 		}
 		switch sh.kind {
@@ -560,6 +569,55 @@ func (e *Engine) lookalikes(text string) []tmCand {
 		}
 	}
 	return out
+}
+
+// enrolledLookalike reports whether the alias-shaped token sh in text is an
+// enrolled real value (R11), and the span to replace: the whole email when
+// a host is the domain of an enrolled email, the address of a CIDR. Minted
+// aliases and values derivable from them are not (a real address equal to
+// a minted one is alias space, R5).
+func (e *Engine) enrolledLookalike(text string, sh shape) (start, end int, kind Kind, ok bool) {
+	v := sh.text
+	switch sh.kind {
+	case shapeHost:
+		if e.underMintedDomain(v) {
+			return 0, 0, "", false
+		}
+		if ls := emailLocalStart(text, sh.Start); ls >= 0 {
+			if _, k, ok := e.s.AliasFor(text[ls:sh.End]); ok {
+				return ls, sh.End, k, true
+			}
+		}
+	case shapeIPv4:
+		if _, ok := e.s.IPv4Real(netip.MustParseAddr(v)); ok {
+			return 0, 0, "", false
+		}
+	case shapeCIDR:
+		ae := sh.Start + strings.IndexByte(v, '/')
+		addr := text[sh.Start:ae]
+		if _, ok := e.s.IPv4Real(netip.MustParseAddr(addr)); ok {
+			return 0, 0, "", false
+		}
+		if _, k, ok := e.s.AliasFor(addr); ok {
+			return sh.Start, ae, k, true
+		}
+		return 0, 0, "", false
+	case shapeIPv6:
+		if _, _, ok := e.s.OriginalFor(netip.MustParseAddr(v).String()); ok {
+			return 0, 0, "", false
+		}
+	case shapeKeyword:
+		if _, _, ok := e.s.OriginalFor(v); ok {
+			return 0, 0, "", false
+		}
+	}
+	if _, _, ok := e.s.OriginalFor(v); ok {
+		return 0, 0, "", false
+	}
+	if _, k, ok := e.s.AliasFor(v); ok {
+		return sh.Start, sh.End, k, true
+	}
+	return 0, 0, "", false
 }
 
 // underMintedDomain reports whether host, or a suffix of it, is a minted
@@ -697,6 +755,14 @@ func (e *Engine) LeakCheck(serialised []byte) []LeakHit {
 		for _, sp := range ipv6s(t, ipv4s(t, nil)) {
 			if _, k, ok := e.s.AliasFor(sp.Value); ok && (k == KindIPv4 || k == KindIPv6) {
 				add(k, toRaw(sp.Start))
+			}
+		}
+		// Enrolled real values inside the alias ranges (240/4,
+		// 2001:db8::/32, <hex6>.example, keyword shapes): the address
+		// detectors skip those ranges. Minted aliases are not flagged.
+		for _, sh := range scanShapes(t) {
+			if s, _, k, ok := e.enrolledLookalike(t, sh); ok {
+				add(k, toRaw(s))
 			}
 		}
 	}

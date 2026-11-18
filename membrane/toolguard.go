@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/netip"
+	"regexp"
 	"strings"
 )
 
@@ -103,29 +104,29 @@ func (e *Engine) CheckTool(tool string, input []byte, membraned bool) ToolVerdic
 	return ToolVerdict{}
 }
 
-// isSeparator reports the word separators a brand may be written with.
-func isSeparator(r rune) bool { return r == '-' || r == '_' || r == '+' || r == '.' }
+// separatorRun matches a run of word separators a brand may be written
+// with (- _ + . / , en and em dash), with the blanks around it.
+var separatorRun = regexp.MustCompile(`\s*[-_+./,\x{2013}\x{2014}]+\s*`)
 
-// separatorViews returns t, t with the word separators - _ + . turned into
-// spaces, and t with them removed, so a brand written acme-bank, acme_bank
-// or acme.bank is caught by the "Acme Bank" / "acmebank" keywords.
+// blankRun matches a run of whitespace (spaces, tabs, newlines).
+var blankRun = regexp.MustCompile(`\s+`)
+
+// separatorViews returns t, t with every separator run and whitespace run
+// turned into one space, and t with separator runs removed, so a brand
+// written acme-bank, acme_bank, acme.bank, acme/bank, ACME–BANK,
+// "Acme - Bank" or "acme  bank" is caught by the "Acme Bank" / "acmebank"
+// keywords.
 func separatorViews(t string) []string {
-	if !strings.ContainsFunc(t, isSeparator) {
-		return []string{t}
+	spaced := blankRun.ReplaceAllString(separatorRun.ReplaceAllString(t, " "), " ")
+	joined := separatorRun.ReplaceAllString(t, "")
+	views := []string{t}
+	if spaced != t {
+		views = append(views, spaced)
 	}
-	spaced := strings.Map(func(r rune) rune {
-		if isSeparator(r) {
-			return ' '
-		}
-		return r
-	}, t)
-	joined := strings.Map(func(r rune) rune {
-		if isSeparator(r) {
-			return -1
-		}
-		return r
-	}, t)
-	return []string{t, spaced, joined}
+	if joined != t && joined != spaced {
+		views = append(views, joined)
+	}
+	return views
 }
 
 // reject records a token the guard blocked (and, for a CIDR, its address),
