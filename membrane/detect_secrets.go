@@ -27,6 +27,7 @@ func (secretDetector) Detect(text string) []Span {
 	out = jsonKeySecrets(text, out)
 	out = kvSecrets(text, out)
 	out = userinfoSecrets(text, out)
+	out = optionSecrets(text, out)
 	out = append(out, gluedFlagSpans(text)...)
 	return out
 }
@@ -49,6 +50,7 @@ var (
 	cmdSepRE    = regexp.MustCompile("\\|\\||&&|[|;]|\\$\\(|`")
 	gluedFlagRE = regexp.MustCompile(`(?:^|\s)-([pu])(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'|;&()]+))`)
 	portMapRE   = regexp.MustCompile(`^[0-9]+(?::[0-9]+)+$`)
+	promptRE    = regexp.MustCompile(`^[^\n]*?[$#>] `)
 )
 
 // gluedFlagSpans reports -p<password> and -u<user> glued to a MySQL-family
@@ -66,7 +68,17 @@ func gluedFlagSpans(text string) []Span {
 			le += ls
 		}
 		segStart := ls
-		for _, m := range cmdSepRE.FindAllStringIndex(text[ls:le], -1) {
+		seps := cmdSepRE.FindAllStringIndex(text[ls:le], -1)
+		// A shell prompt ($ , # , > , user@h:~# ) may precede the first
+		// command of a line; the text after it is tried as a command too.
+		firstEnd := le
+		if len(seps) > 0 {
+			firstEnd = ls + seps[0][0]
+		}
+		if p := promptRE.FindStringIndex(text[ls:firstEnd]); p != nil {
+			out = commandFlags(text, ls+p[1], firstEnd, out)
+		}
+		for _, m := range seps {
 			out = commandFlags(text, segStart, ls+m[0], out)
 			segStart = ls + m[1]
 		}
@@ -98,12 +110,87 @@ func commandFlags(text string, s, e int, out []Span) []Span {
 }
 
 // commandWord returns the base name of the command word of text[s:e] and
-// its range, skipping blanks, '(' and wrappers (sudo with its options,
-// exec, time, nohup).
+// its range. It walks the words of the command: blanks and '(' are
+// skipped, and so are NAME=value environment assignments and wrappers
+// with their own options and operands (sudo -u x, env, nice -n 10, watch,
+// xargs, timeout 10, stdbuf, docker|podman [compose] exec [opts] CTR,
+// docker run [opts] IMAGE, kubectl ... --, ssh [opts] HOST). The first
+// other word is the command. Words that only name a file or an option
+// argument (find /var/lib/mysql -user mysql) are never reached, because
+// find is not a wrapper.
 func commandWord(text string, s, e int) (string, int, int) {
-	i := s
-	skipArg := false
-	for i < e {
+	toks := words(text, s, e)
+	for k := 0; k < len(toks); {
+		tok := text[toks[k][0]:toks[k][1]]
+		w, ok := wrappers[tok]
+		switch {
+		case envAssignRE.MatchString(tok) && k+1 < len(toks):
+			k++
+			continue
+		case !ok:
+			return tok[strings.LastIndexByte(tok, '/')+1:], toks[k][0], toks[k][1]
+		case w.dashDash: // kubectl ... -- cmd
+			k = afterDashDash(text, toks, k+1)
+			continue
+		case w.sub != nil: // docker exec / docker run
+			k++
+			for k < len(toks) && passThrough[text[toks[k][0]:toks[k][1]]] {
+				k++ // docker compose exec, docker container exec
+			}
+			if k >= len(toks) || w.sub[text[toks[k][0]:toks[k][1]]] == nil {
+				return "", e, e
+			}
+			w = *w.sub[text[toks[k][0]:toks[k][1]]]
+		}
+		k = skipOptions(text, toks, k+1, w)
+	}
+	return "", e, e
+}
+
+// wrapper describes a command that runs another command: argOpts are its
+// short options that take an argument, argLong its long ones, operands
+// the positional words before the command (ssh HOST, timeout DURATION).
+type wrapper struct {
+	argOpts  string
+	argLong  map[string]bool
+	operands int
+	dashDash bool                // the command follows "--" (kubectl exec)
+	sub      map[string]*wrapper // subcommands (docker exec, docker run)
+}
+
+var (
+	envAssignRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
+	passThrough = map[string]bool{"compose": true, "container": true}
+	dockerExec  = &wrapper{argOpts: "euw", operands: 1,
+		argLong: map[string]bool{"--env": true, "--user": true, "--workdir": true, "--env-file": true, "--detach-keys": true}}
+	dockerRun = &wrapper{argOpts: "acehlmpuvw", operands: 1, argLong: map[string]bool{
+		"--name": true, "--network": true, "--volume": true, "--env": true, "--publish": true, "--user": true,
+		"--workdir": true, "--entrypoint": true, "--mount": true, "--label": true, "--hostname": true,
+		"--memory": true, "--cpus": true, "--platform": true, "--restart": true, "--add-host": true,
+		"--env-file": true, "--link": true, "--log-driver": true, "--log-opt": true, "--net": true}}
+	containerCmds = map[string]*wrapper{"exec": dockerExec, "run": dockerRun}
+	wrappers      = map[string]wrapper{
+		"sudo": {argOpts: "ugpChDrtUT", argLong: map[string]bool{"--user": true, "--group": true}},
+		"exec": {}, "time": {}, "nohup": {}, "command": {}, "builtin": {}, "doas": {argOpts: "uC"},
+		"env":     {argOpts: "uCS", argLong: map[string]bool{"--unset": true, "--chdir": true}},
+		"nice":    {argOpts: "n"},
+		"ionice":  {argOpts: "cnp"},
+		"watch":   {argOpts: "n", argLong: map[string]bool{"--interval": true}},
+		"xargs":   {argOpts: "IadEeLlnPsS"},
+		"timeout": {argOpts: "sk", argLong: map[string]bool{"--signal": true, "--kill-after": true}, operands: 1},
+		"stdbuf":  {argOpts: "ioe"},
+		"chroot":  {operands: 1},
+		"ssh":     {argOpts: "BbcDEeFIiJLlmOoPpQRSWw", operands: 1},
+		"kubectl": {dashDash: true}, "oc": {dashDash: true},
+		"docker": {sub: containerCmds}, "podman": {sub: containerCmds}, "nerdctl": {sub: containerCmds},
+		"docker-compose": {sub: containerCmds},
+	}
+)
+
+// words splits text[s:e] at blanks, dropping a word's leading '('.
+func words(text string, s, e int) [][2]int {
+	var out [][2]int
+	for i := s; i < e; {
 		for i < e && (text[i] == ' ' || text[i] == '\t' || text[i] == '(') {
 			i++
 		}
@@ -111,22 +198,48 @@ func commandWord(text string, s, e int) (string, int, int) {
 		for j < e && text[j] != ' ' && text[j] != '\t' {
 			j++
 		}
-		if i >= j {
-			return "", i, i
-		}
-		tok := text[i:j]
-		switch {
-		case skipArg:
-			skipArg = false
-		case tok == "sudo" || tok == "exec" || tok == "time" || tok == "nohup":
-		case strings.HasPrefix(tok, "-") && i > s:
-			skipArg = tok == "-u" || tok == "-g" // sudo -u user
-		default:
-			return tok[strings.LastIndexByte(tok, '/')+1:], i, j
+		if i < j {
+			out = append(out, [2]int{i, j})
 		}
 		i = j
 	}
-	return "", e, e
+	return out
+}
+
+// skipOptions skips a wrapper's options (with their arguments) and its
+// operands from word k on, and returns the index of the next word.
+func skipOptions(text string, toks [][2]int, k int, w wrapper) int {
+	for k < len(toks) {
+		tok := text[toks[k][0]:toks[k][1]]
+		if tok == "--" {
+			k++
+			break
+		}
+		if len(tok) < 2 || tok[0] != '-' {
+			break
+		}
+		k++
+		switch {
+		case strings.HasPrefix(tok, "--"):
+			if w.argLong[tok] {
+				k++
+			}
+		case len(tok) == 2 && strings.IndexByte(w.argOpts, tok[1]) >= 0:
+			k++ // -u user, -n 10
+		}
+	}
+	return min(k+w.operands, len(toks))
+}
+
+// afterDashDash returns the index after the first "--" word from k on, or
+// len(toks) when there is none.
+func afterDashDash(text string, toks [][2]int, k int) int {
+	for ; k < len(toks); k++ {
+		if text[toks[k][0]:toks[k][1]] == "--" {
+			return k + 1
+		}
+	}
+	return len(toks)
 }
 
 // oneCommand reads the options of one command in text[s:e].
@@ -723,6 +836,78 @@ func quotedValue(text string, s, e int, k Kind, out []Span) []Span {
 		return authValue(text, s, e, out)
 	}
 	if sp, ok := valueSpan(text, s, e, k); ok {
+		out = append(out, sp)
+	}
+	return out
+}
+
+// Command-line options: --password=v, --pass=v, -password=v, --user=v
+// and the space-separated --password v. kvRE needs a separator before the
+// key, so a dash-prefixed key is read here. The '=' form takes any key
+// keyKind accepts; the space form only a double-dash name in spaceOptNames
+// (most --flag v pairs are not credentials, psql --password takes no value,
+// and find's -user takes a system user name).
+var (
+	optEqRE    = regexp.MustCompile(`(?:^|[\s'"(])--?([A-Za-z][A-Za-z0-9_.-]{0,40})=` + quotedOr(`[^\s"'<>;|&()]+`))
+	optSpaceRE = regexp.MustCompile(`(?:^|[\s'"(])--([A-Za-z][A-Za-z0-9_-]{0,40})[ \t]+` + quotedOr(`[^\s"'<>;|&()-][^\s"'<>;|&()]*`))
+	// envVarRE: a $NAME reference (the value comes from the environment).
+	envVarRE = regexp.MustCompile(`^\$[A-Za-z_][A-Za-z0-9_]*$`)
+	// uidRE: a numeric user or user:group id (docker run --user 1000:1000).
+	uidRE = regexp.MustCompile(`^[0-9]+(?::[0-9]+)?$`)
+)
+
+var spaceOptNames = map[string]bool{
+	"password": true, "passwd": true, "pass": true, "pwd": true, "user": true, "username": true,
+	"login": true, "token": true, "api-key": true, "api_key": true, "apikey": true, "secret": true,
+	"client-secret": true, "client_secret": true, "access-key": true, "secret-key": true,
+	"auth-token": true, "access-token": true, "db-password": true, "db-user": true,
+}
+
+func optionSecrets(text string, out []Span) []Span {
+	if !strings.Contains(text, "-") {
+		return out
+	}
+	pre := lineHas(text, "-")
+	for _, m := range lineMatches(optEqRE, text, pre) {
+		out = optionValue(text, m, false, out)
+	}
+	for _, m := range lineMatches(optSpaceRE, text, pre) {
+		out = optionValue(text, m, true, out)
+	}
+	return out
+}
+
+func optionValue(text string, m []int, spaced bool, out []Span) []Span {
+	name := lowerASCII(text[m[2]:m[3]])
+	if spaced && !spaceOptNames[name] {
+		return out
+	}
+	// Option names that hold a path, an agent string or a directory, not a
+	// credential (--key-file, --user-agent, --user-data-dir, --ssh-key).
+	for _, w := range []string{"agent", "file", "dir", "path", "ssh-key", "keyring", "store"} {
+		if strings.Contains(name, w) {
+			return out
+		}
+	}
+	k, ok := keyKind(name)
+	if !ok {
+		return out
+	}
+	vs, ve := valueGroup(m, 2)
+	if vs < 0 {
+		return out
+	}
+	v := text[vs:ve]
+	if envVarRE.MatchString(v) || strings.HasPrefix(v, "`") || strings.HasPrefix(v, "$(") || placeholderValue(v) {
+		return out
+	}
+	if k == KindUsername && uidRE.MatchString(v) {
+		return out
+	}
+	if k == KindToken && strings.ContainsAny(v[:1], "/~.") {
+		return out // a path
+	}
+	if sp, ok := valueSpan(text, vs, ve, k); ok {
 		out = append(out, sp)
 	}
 	return out

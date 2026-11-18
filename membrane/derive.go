@@ -75,7 +75,7 @@ func (e *Engine) toReal(text string, depth int) (string, []string) {
 		}
 	}
 	for _, sh := range scanShapes(text) {
-		cands = append(cands, e.deriveShape(sh))
+		cands = append(cands, e.deriveShape(text, sh))
 	}
 	cands = append(cands, e.jwtCandidates(text)...)
 	for _, sp := range gluedFlagSpans(text) {
@@ -133,14 +133,17 @@ func (e *Engine) hostSuffixOK(t string, m Match) bool {
 	if m.Kind != KindDomain && m.Kind != KindEmail {
 		return true
 	}
-	if byteAfter(t, m.End) != '.' {
+	return e.continuationOK(t, m.End, m.Original)
+}
+
+// continuationOK applies the hostSuffixOK rule to a reversal that yields
+// real (a host or an email) ending at t[end].
+func (e *Engine) continuationOK(t string, end int, real string) bool {
+	rest, ok := hostContinuation(t, end)
+	if !ok {
 		return true
 	}
-	end := m.End + 1
-	for end < len(t) && (isHostByte(t[end]) || t[end] == '.') {
-		end++
-	}
-	rest := strings.ToLower(strings.TrimRight(t[m.End+1:end], "."))
+	rest = strings.ToLower(strings.TrimRight(rest, "."))
 	if rest == "" {
 		return true // a sentence dot
 	}
@@ -148,7 +151,7 @@ func (e *Engine) hostSuffixOK(t string, m Match) bool {
 	if ps, icann := publicsuffix.PublicSuffix(rest); !icann && ps == last {
 		return true // implicit default rule: not a public suffix
 	}
-	host := m.Original
+	host := real
 	if i := strings.LastIndexByte(host, '@'); i >= 0 {
 		host = host[i+1:]
 	}
@@ -164,6 +167,65 @@ func (e *Engine) hostSuffixOK(t string, m Match) bool {
 	return false
 }
 
+// hostContinuation reads the host text that continues an alias ending at
+// i: a dot, then labels and dots. URL parsers and IDNA decode the host, so
+// encoded dots (%2E, %252E, &#46;, &#x2e;, \. , \x2e, \u002e, fullwidth and
+// ideographic full stops) count as dots and %XX host bytes as those bytes:
+// ffcc79.example%2Ecom must be judged as acmebank.pt.com. ok is false when
+// no dot follows.
+func hostContinuation(t string, i int) (string, bool) {
+	n := dotLen(t, i)
+	if n == 0 {
+		return "", false
+	}
+	var b strings.Builder
+	for i += n; i < len(t); {
+		if n := dotLen(t, i); n > 0 {
+			b.WriteByte('.')
+			i += n
+			continue
+		}
+		c := t[i]
+		if c == '%' && i+2 < len(t) && isHexByte(t[i+1]) && isHexByte(t[i+2]) {
+			hi, _ := unhex(t[i+1])
+			lo, _ := unhex(t[i+2])
+			if c = hi<<4 | lo; !isHostByte(c) {
+				break
+			}
+			b.WriteByte(c)
+			i += 3
+			continue
+		}
+		if !isHostByte(c) {
+			break
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String(), true
+}
+
+// encodedDots are spellings of '.' that a URL parser, HTML decoder, shell
+// or IDNA mapping turns into a dot, lowercase (matched case-insensitively).
+var encodedDots = []string{".", "%2e", "%252e", "&#46;", "&#046;", "&#x2e;", "&#x002e;", "\\.", "\\x2e", "\\u002e",
+	"\uff0e", "\u3002", "\uff61"}
+
+// dotLen returns the length of a dot spelling at t[i:], or 0.
+func dotLen(t string, i int) int {
+	if i >= len(t) {
+		return 0
+	}
+	if c := t[i]; c != '.' && c != '%' && c != '&' && c != '\\' && c < utf8.RuneSelf {
+		return 0
+	}
+	for _, d := range encodedDots {
+		if len(t)-i >= len(d) && strings.EqualFold(t[i:i+len(d)], d) {
+			return len(d)
+		}
+	}
+	return 0
+}
+
 // reverseText is the original for alias match m written as matched. A
 // keyword alias written in lowercase (the DNS form inside hostnames) gives
 // the lowercase original.
@@ -175,11 +237,13 @@ func reverseText(matched string, m Match) string {
 }
 
 // deriveShape resolves one alias-shaped token by exact lookup or derivation.
-func (e *Engine) deriveShape(sh shape) rCand {
+func (e *Engine) deriveShape(text string, sh shape) rCand {
 	c := rCand{Start: sh.Start, End: sh.End, prio: prioDerive, blocked: true}
 	switch sh.kind {
 	case shapeHost:
-		if real, ok := e.resolveHost(sh.text, true); ok {
+		// A host continued by an encoded dot (alias%2Ecom) is judged as
+		// the host a URL parser would see.
+		if real, ok := e.resolveHost(sh.text, true); ok && e.continuationOK(text, sh.End, real) {
 			c.repl, c.blocked = real, false
 		}
 	case shapeIPv4:
