@@ -20,8 +20,9 @@ const (
 
 // streamDelims end a token: no alias shape (host, URL, email, IP, CIDR,
 // keyword) contains one. Format-preserving aliases can; those are protected
-// by the exact-alias span check in cut.
-const streamDelims = "\"'<>()[]{},;`"
+// by the exact-alias span check in cut. CJK and full-width punctuation (and
+// the ideographic space) delimit too: CJK prose has no ASCII blanks.
+const streamDelims = "\"'<>()[]{},;`" + "，。、：；！？（）【】《》「」\u3000"
 
 func isStreamDelim(r rune) bool { return unicode.IsSpace(r) || strings.ContainsRune(streamDelims, r) }
 
