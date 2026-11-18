@@ -113,9 +113,16 @@ func (s *Server) membraneSyncTaskID(ctx context.Context, id int64) ([]int64, err
 	if sd == nil {
 		return nil, nil
 	}
+	return sd.task(ctx, id)
+}
+
+// task seeds task id (its companies first) into the seeder's store and
+// returns the task's company ids. The preview runs it over a dry-run store.
+func (sd *seeder) task(ctx context.Context, id int64) ([]int64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	s := sd.s
 	pg := s.m.pg
 	task, err := pg.GetTask(id)
 	if err != nil {

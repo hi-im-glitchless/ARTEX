@@ -345,6 +345,38 @@ func (d *DB) GetLLMRecord(id int64) (*LLMRecord, error) {
 	return &r, nil
 }
 
+// LLMRawRequest is the wire-level request body of one LLM record (empty when
+// the transport did not capture it). It never carries the operator view
+// (request_body).
+type LLMRawRequest struct {
+	ID      int64
+	Profile string
+	Raw     string
+}
+
+// LLMRawRequests pages the records of one exact task_id in id order (keyset:
+// ids greater than afterID), at most limit rows.
+func (d *DB) LLMRawRequests(taskID string, afterID int64, limit int) ([]LLMRawRequest, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := d.Query(`SELECT id, COALESCE(profile_name,''), COALESCE(raw_request,'') FROM llm_records
+		WHERE COALESCE(task_id,'') = $1 AND id > $2 ORDER BY id LIMIT $3`, taskID, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LLMRawRequest
+	for rows.Next() {
+		var r LLMRawRequest
+		if err := rows.Scan(&r.ID, &r.Profile, &r.Raw); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 func nullIfEmpty(s string) any {
 	if s == "" {
 		return nil

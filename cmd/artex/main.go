@@ -51,6 +51,10 @@ func main() {
 }
 
 func run() int {
+	// Offline subcommand: `artex membrane verify --task <id>` (no server).
+	if len(os.Args) > 1 && os.Args[1] == "membrane" {
+		return runMembrane(os.Args[2:], os.Stdout, os.Stderr)
+	}
 	var (
 		addr    = flag.String("addr", ":8787", "HTTP listen address")
 		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")

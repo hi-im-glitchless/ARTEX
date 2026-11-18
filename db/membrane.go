@@ -471,3 +471,55 @@ func (d *DB) MembraneCompanyReferences(companyID int64) (map[string]int, error) 
 	}
 	return out, nil
 }
+
+// MembraneTaskEvents returns every event of taskID in chain (id) order.
+func (d *DB) MembraneTaskEvents(taskID string) ([]MembraneEvent, error) {
+	return d.membraneEventsWhere(`task_id=$1`, taskID)
+}
+
+// MembraneEventsByDirection returns the events of one direction (for example
+// "override" or "destroy") whose timestamp lies in [from, to], in id order.
+func (d *DB) MembraneEventsByDirection(direction string, from, to time.Time) ([]MembraneEvent, error) {
+	return d.membraneEventsWhere(`direction=$1 AND ts >= $2 AND ts <= $3`, direction, from.UTC(), to.UTC())
+}
+
+func (d *DB) membraneEventsWhere(where string, args ...any) ([]MembraneEvent, error) {
+	rows, err := d.Query(`SELECT `+membraneEventCols+` FROM membrane_events WHERE `+where+` ORDER BY id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MembraneEvent
+	for rows.Next() {
+		ev, err := scanMembraneEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+// MembraneChainHead describes the newest event of the chain. A later export
+// that finds a smaller count, or another hash at LastID, detects truncation,
+// which VerifyMembraneChain alone cannot (deleting the newest rows leaves a
+// consistent shorter chain).
+type MembraneChainHead struct {
+	LastID int64  `json:"last_id"`
+	Hash   string `json:"hash"`
+	Count  int    `json:"count"`
+}
+
+// MembraneChainHeadNow returns the current chain head (zero value when the
+// chain is empty).
+func (d *DB) MembraneChainHeadNow() (MembraneChainHead, error) {
+	var h MembraneChainHead
+	if err := d.QueryRow(`SELECT count(*) FROM membrane_events`).Scan(&h.Count); err != nil {
+		return h, err
+	}
+	err := d.QueryRow(`SELECT id, hash FROM membrane_events ORDER BY id DESC LIMIT 1`).Scan(&h.LastID, &h.Hash)
+	if err == sql.ErrNoRows {
+		return h, nil
+	}
+	return h, err
+}
