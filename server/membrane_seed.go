@@ -153,7 +153,8 @@ func (s *Server) membraneSyncTaskID(ctx context.Context, id int64) ([]int64, err
 	// Pass 1: keywords and declared roots, so pass 2 can classify hosts.
 	// Declared: a root_domain row not added automatically (source manual,
 	// set by the UI, or agent, set by add_task_scope; insertAssets writes
-	// auto), and a task target written as a bare root domain.
+	// auto), and the root of the task's target host. A shared multi-tenant
+	// root (membrane.IsSharedTenantRoot) is never declared.
 	for _, r := range scope {
 		var err error
 		switch {
@@ -166,8 +167,10 @@ func (s *Server) membraneSyncTaskID(ctx context.Context, id int64) ([]int64, err
 			return nil, fmt.Errorf("membrane seed: task scope %s row %d: %w", r.Kind, r.ID, err)
 		}
 	}
-	if target != "" && isBareRoot(target) {
-		if err := sd.declareRoot(target, prov); err != nil {
+	if target != "" {
+		// The task's target is operator-declared scope: its root is a
+		// client root unless it is a shared multi-tenant root.
+		if err := sd.declareHostRoot(target, prov); err != nil {
 			return nil, fmt.Errorf("membrane seed: task target: %w", err)
 		}
 	}
@@ -195,11 +198,6 @@ func (s *Server) membraneSyncTaskID(ctx context.Context, id int64) ([]int64, err
 		}
 	}
 
-	if target != "" {
-		if err := sd.host(target, prov); err != nil {
-			return nil, fmt.Errorf("membrane seed: task target: %w", err)
-		}
-	}
 	if err := sd.assets(`$1::bigint = ANY(task_ids)`, id, prov); err != nil {
 		return nil, fmt.Errorf("membrane seed: task assets: %w", err)
 	}
@@ -247,26 +245,17 @@ func (sd *seeder) company(cid int64) error {
 	if err != nil {
 		return fmt.Errorf("load company scope: %w", err)
 	}
-	// Pass 1: keywords and declared roots (a scope domain that is itself a
-	// registrable root); pass 2: other hosts, classified, and networks.
+	// A company scope domain is operator-declared: its root is a client root
+	// unless it is a shared multi-tenant root (acme.okta.com declares the
+	// tenant, not okta.com).
 	for _, r := range rules {
 		var err error
-		switch {
-		case r.Kind == "keyword" || r.Kind == "icp":
+		switch r.Kind {
+		case "keyword", "icp":
 			err = sd.keyword(r.Value, prov)
-		case r.Kind == "domain" && isBareRoot(r.Domain):
-			err = sd.declareRoot(r.Domain, prov)
-		}
-		if err != nil {
-			return fmt.Errorf("company scope %s row %d: %w", r.Kind, r.ID, err)
-		}
-	}
-	for _, r := range rules {
-		var err error
-		switch {
-		case r.Kind == "domain" && !isBareRoot(r.Domain):
-			err = sd.host(r.Domain, prov)
-		case r.Kind == "ip" || r.Kind == "cidr":
+		case "domain":
+			err = sd.declareHostRoot(r.Domain, prov)
+		case "ip", "cidr":
 			err = sd.network(r.Net, prov)
 		}
 		if err != nil {
@@ -394,6 +383,9 @@ func (sd *seeder) classifiedHost(h string, prov membrane.Provenance, rootOnly bo
 // clientRoot reports whether root is client space, opting in a root whose
 // label carries an enrolled client keyword (with its brand variant).
 func (sd *seeder) clientRoot(root string, prov membrane.Provenance) (bool, error) {
+	if membrane.IsSharedTenantRoot(root) {
+		return false, nil
+	}
 	if sd.st.HasRoot(root) {
 		return true, nil
 	}
@@ -405,9 +397,9 @@ func (sd *seeder) clientRoot(root string, prov membrane.Provenance) (bool, error
 }
 
 // declareRoot opts in a root the operator declared (a company scope domain
-// or a non-auto task root_domain row that is a registrable root, a task
-// target written as a bare root) and enrols its brand variant. Anything
-// else goes through classification.
+// or a non-auto task root_domain row that is a registrable root) and enrols
+// its brand variant, unless it is a shared multi-tenant root. A non-root
+// value goes through classification.
 func (sd *seeder) declareRoot(d string, prov membrane.Provenance) error {
 	h, root, ok := registrableRoot(hostOf(d))
 	if !ok {
@@ -416,7 +408,30 @@ func (sd *seeder) declareRoot(d string, prov membrane.Provenance) error {
 	if h != root {
 		return sd.host(h, prov)
 	}
-	return sd.enrollRoot(root, prov)
+	return sd.declareHostRoot(h, prov)
+}
+
+// declareHostRoot opts in the registrable root of a host the operator
+// declared as a target (any host of a task's target/URL fields), then
+// enrols the host. Under a shared multi-tenant root (okta.com,
+// amazonaws.com... see membrane.IsSharedTenantRoot) the root is never the
+// client's: the host gets the third-party tenant-label rule instead.
+func (sd *seeder) declareHostRoot(d string, prov membrane.Provenance) error {
+	h, root, ok := registrableRoot(hostOf(d))
+	if !ok {
+		return nil
+	}
+	if membrane.IsSharedTenantRoot(root) {
+		return sd.tenantLabel(h, root, prov)
+	}
+	if err := sd.enrollRoot(root, prov); err != nil {
+		return err
+	}
+	if h == root {
+		return nil
+	}
+	_, err := sd.st.Enroll(membrane.KindDomain, h, prov)
+	return err
 }
 
 func (sd *seeder) enrollRoot(root string, prov membrane.Provenance) error {
@@ -578,10 +593,4 @@ func registrableRoot(h string) (host, root string, ok bool) {
 		return "", "", false
 	}
 	return a, r, true
-}
-
-// isBareRoot reports whether d is itself a registrable root domain.
-func isBareRoot(d string) bool {
-	h, root, ok := registrableRoot(hostOf(d))
-	return ok && h == root
 }

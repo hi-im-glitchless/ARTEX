@@ -285,3 +285,59 @@ func TestMembraneSyncThirdPartyRoot(t *testing.T) {
 		}
 	}
 }
+
+// A task's target host is operator-declared scope: its root becomes a client
+// root, except under a shared multi-tenant root (tenant label only).
+func TestMembraneSyncTargetRoot(t *testing.T) {
+	t.Setenv("ARTEX_MEMBRANE", "")
+	membraneTestKeys(t)
+	s, m := newMembraneTestServer(t)
+	pg := m.pg
+	newTask := func(goal string) {
+		t.Helper()
+		tk, err := pg.CreateTask("membrane target test", goal, nil, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = pg.Exec(`DELETE FROM membrane_entries WHERE $1::bigint = ANY(task_ids)`, tk.ID)
+			_ = pg.DeleteTask(tk.ID)
+		})
+		if _, err := s.SyncTask(context.Background(), strconv.FormatInt(tk.ID, 10)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, e := s.membraneStore(), s.membraneEngine()
+
+	goal := "Assess the login flow at https://portal.somebrand.com/login"
+	newTask(goal)
+	if !st.HasRoot("somebrand.com") {
+		t.Fatal("target root is not a client root")
+	}
+	if _, _, ok := st.AliasFor("portal.somebrand.com"); !ok {
+		t.Fatal("target host not aliased")
+	}
+	out, _, err := e.ToModel(goal, membrane.Provenance{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "somebrand") {
+		t.Fatalf("target reaches the model in clear: %q", out)
+	}
+
+	goal = "Review SSO at https://acme.okta.com"
+	newTask(goal)
+	if st.HasRoot("okta.com") {
+		t.Fatal("a shared multi-tenant root became a client root")
+	}
+	if _, _, ok := st.AliasFor("acme"); !ok {
+		t.Fatal("tenant label of the target not aliased")
+	}
+	out, _, err = e.ToModel(goal, membrane.Provenance{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "acme.") || !strings.Contains(out, ".okta.com") {
+		t.Fatalf("model view = %q", out)
+	}
+}

@@ -63,6 +63,17 @@ func TestEnrollRootOptIn(t *testing.T) {
 	if _, err := s.EnrollRoot("portal.acme.pt", seedProv); err == nil {
 		t.Fatal("EnrollRoot must refuse a subdomain")
 	}
+	for _, r := range []string{"okta.com", "AmazonAWS.com", "atlassian.net"} {
+		if !IsSharedTenantRoot(r) {
+			t.Fatalf("%s must be a shared tenant root", r)
+		}
+		if _, err := s.EnrollRoot(r, seedProv); err == nil || s.HasRoot(strings.ToLower(r)) {
+			t.Fatalf("EnrollRoot must refuse the shared root %s", r)
+		}
+	}
+	if IsSharedTenantRoot("acmebank.pt") {
+		t.Fatal("client root reported as shared")
+	}
 	ra, err := s.EnrollRoot("Acme.PT", seedProv)
 	if err != nil {
 		t.Fatal(err)

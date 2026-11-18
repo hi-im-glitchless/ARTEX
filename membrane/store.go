@@ -502,6 +502,9 @@ func (s *Store) EnrollRoot(root string, prov Provenance) (string, error) {
 	if !isRootDomain(norm) {
 		return "", errors.New("membrane enroll root: not a registrable domain")
 	}
+	if IsSharedTenantRoot(norm) {
+		return "", errors.New("membrane enroll root: a shared multi-tenant root is never a client root")
+	}
 	s.enrollMu.Lock()
 	defer s.enrollMu.Unlock()
 	return s.enrollLocked(KindDomain, norm, prov, enrolRoot)
