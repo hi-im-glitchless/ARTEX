@@ -18,6 +18,9 @@ var jwtRE = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{2,}\.eyJ[A-Za-z0-9_-]{2,}\.[A-Z
 
 var jwtSegment = base64.RawURLEncoding.Strict()
 
+// minJWTSignature is the shortest signature segment that is aliased.
+const minJWTSignature = 16
+
 func isB64URLByte(c byte) bool { return isASCIIAlnum(c) || c == '-' || c == '_' }
 
 // parseJWT splits tok into its decoded JSON header and payload and its
@@ -91,7 +94,9 @@ func (e *Engine) jwtToModel(tok string, prov Provenance, rep *Report) (string, b
 	}
 	rep.merge(segRep)
 	ns := sig
-	if sig != "" {
+	// A real signature is 43+ characters (HS256). A short segment is not a
+	// secret, and enrolling it (eyJ) would match inside every JWT.
+	if len(sig) >= minJWTSignature {
 		a, keep, err := e.aliasValue(KindToken, sig, prov, rep)
 		if err != nil {
 			return "", false, err

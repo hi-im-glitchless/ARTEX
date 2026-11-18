@@ -55,14 +55,14 @@ func (e *Engine) toReal(text string, depth int) (string, []string) {
 	rd := e.s.ReverseDictionary()
 	var cands []rCand
 	for _, m := range rd.FindAll(text) {
-		if !hostSuffixOK(text, m) {
+		if !e.hostSuffixOK(text, m) {
 			continue
 		}
 		cands = append(cands, rCand{Start: m.Start, End: m.End, repl: reverseText(text[m.Start:m.End], m), prio: prioExact})
 	}
 	for _, v := range decodedViews(text) {
 		for _, m := range rd.FindAll(v.text) {
-			if !hostSuffixOK(v.text, m) {
+			if !e.hostSuffixOK(v.text, m) {
 				continue
 			}
 			sp, ok := v.toRaw(text, Span{Start: m.Start, End: m.End})
@@ -119,35 +119,49 @@ func (e *Engine) toReal(text string, depth int) (string, []string) {
 	return b.String(), unresolved
 }
 
-// hostSuffixOK rejects a domain or email alias match that is the left part
-// of a third-party host: in evil.ffcc79.example.attacker.com or
-// ffcc79.example.evil.com the continuation (attacker.com, evil.com) is a
-// registrable domain, so the alias is a label sequence of someone else's
-// host, not client space. A continuation that is not a registrable domain
-// is a file extension or similar (ffcc79.example.crt, .conf, .nmap, .xml,
-// a lone .com) and the alias resolves, matching the forward direction,
-// which aliases a domain followed by '.'.
-func hostSuffixOK(t string, m Match) bool {
+// hostSuffixOK decides whether a domain or email alias followed by '.' and
+// more host text may be reversed: the reversed host must not land in
+// someone else's registrable space (a prompt-injected model could otherwise
+// exfiltrate the client domain to attacker DNS or buckets:
+// ffcc79.example.com -> acmebank.pt.com, .github.io, .s3.amazonaws.com).
+// It is reversed only when the continuation is not a public suffix at all
+// (publicsuffix falls back to its implicit one-label, non-ICANN default rule:
+// .crt .conf .nmap .gnmap .xml .in-addr), or when the whole reversed host's
+// registrable domain is a client root. File extensions that are real TLDs
+// (.sh .zip .py .md .pl) do not round-trip: accepted trade-off.
+func (e *Engine) hostSuffixOK(t string, m Match) bool {
 	if m.Kind != KindDomain && m.Kind != KindEmail {
 		return true
 	}
 	if byteAfter(t, m.End) != '.' {
 		return true
 	}
-	e := m.End + 1
-	for e < len(t) && (isHostByte(t[e]) || t[e] == '.') {
-		e++
+	end := m.End + 1
+	for end < len(t) && (isHostByte(t[end]) || t[end] == '.') {
+		end++
 	}
-	rest := strings.ToLower(strings.TrimRight(t[m.End+1:e], "."))
-	if !strings.Contains(rest, ".") {
-		return true
+	rest := strings.ToLower(strings.TrimRight(t[m.End+1:end], "."))
+	if rest == "" {
+		return true // a sentence dot
 	}
-	_, err := publicsuffix.EffectiveTLDPlusOne(rest)
+	last := rest[strings.LastIndexByte(rest, '.')+1:]
+	if ps, icann := publicsuffix.PublicSuffix(rest); !icann && ps == last {
+		return true // implicit default rule: not a public suffix
+	}
+	host := m.Original
+	if i := strings.LastIndexByte(host, '@'); i >= 0 {
+		host = host[i+1:]
+	}
+	root, err := publicsuffix.EffectiveTLDPlusOne(strings.ToLower(host) + "." + rest)
 	if err != nil {
-		return true
+		return false
 	}
-	_, icann := publicsuffix.PublicSuffix(rest)
-	return !icann
+	for _, r := range e.s.Roots() {
+		if r == root {
+			return true
+		}
+	}
+	return false
 }
 
 // reverseText is the original for alias match m written as matched. A

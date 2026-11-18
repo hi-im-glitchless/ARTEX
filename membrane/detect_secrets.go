@@ -31,33 +31,151 @@ func (secretDetector) Detect(text string) []Span {
 	return out
 }
 
-// gluedFlagRE: a credential glued to its short option, as the MySQL client
-// family (-ubob -pS3cret) and sshpass (-pS3cret) take it. Group 1 is the
-// option letter, group 2 the value.
-var gluedFlagRE = regexp.MustCompile(`(?:^|[\s"'])-([pu])([^\s"']+)`)
+// Glued credential options: the MySQL client family takes -u<user> and
+// -p<password> glued (mysql -ubob -pS3cret), sshpass takes -p<password>.
+// Only options that belong to such a command are read: the command word
+// must stand at command position (line start, after | ; && || $( or a
+// backtick, after sudo/exec/time/nohup, or right after an opening quote:
+// ssh host 'mysql -p...'), and its options run to the end of that command.
+// Not credentials: ssh -p2222, psql -p5432, docker -p3306:3306, find
+// -path/-print/-prune, mkdir -pv, and $VAR / ${VAR} / $(...) values.
 
-// gluedFlagSpans reports -p<password> and -u<user> on lines that run a
-// command taking credentials that way (not ssh -p2222, psql -p5432: those
-// are ports, and their lines carry no anchor). sshpass only takes -p.
+var mysqlFamily = map[string]bool{
+	"mysql": true, "mysqldump": true, "mysqladmin": true, "mysqlcheck": true, "mysqlimport": true,
+	"mysqlshow": true, "mariadb": true, "mariadb-dump": true, "mariadb-admin": true,
+}
+
+var (
+	cmdSepRE    = regexp.MustCompile("\\|\\||&&|[|;]|\\$\\(|`")
+	gluedFlagRE = regexp.MustCompile(`(?:^|\s)-([pu])(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'|;&()]+))`)
+	portMapRE   = regexp.MustCompile(`^[0-9]+(?::[0-9]+)+$`)
+)
+
+// gluedFlagSpans reports -p<password> and -u<user> glued to a MySQL-family
+// command, and -p<password> glued to sshpass.
 func gluedFlagSpans(text string) []Span {
+	if !strings.Contains(text, "mysql") && !strings.Contains(text, "mariadb") && !strings.Contains(text, "sshpass") {
+		return nil
+	}
 	var out []Span
-	pre := lineHasAny(text, "mysql", "mariadb", "sshpass")
-	for _, m := range lineMatches(gluedFlagRE, text, pre) {
-		k := KindPassword
-		if text[m[2]:m[3]] == "u" {
-			k = KindUsername
-			ls := strings.LastIndexByte(text[:m[0]+1], '\n') + 1
-			le := strings.IndexByte(text[m[0]:], '\n')
-			if le < 0 {
-				le = len(text)
-			} else {
-				le += m[0]
+	for ls := 0; ls < len(text); {
+		le := strings.IndexByte(text[ls:], '\n')
+		if le < 0 {
+			le = len(text)
+		} else {
+			le += ls
+		}
+		segStart := ls
+		for _, m := range cmdSepRE.FindAllStringIndex(text[ls:le], -1) {
+			out = commandFlags(text, segStart, ls+m[0], out)
+			segStart = ls + m[1]
+		}
+		out = commandFlags(text, segStart, le, out)
+		ls = le + 1
+	}
+	return out
+}
+
+// commandFlags reads the credential options of the command in text[s:e],
+// and of commands opened by a quote inside it (ssh host 'mysql -p...').
+func commandFlags(text string, s, e int, out []Span) []Span {
+	out = oneCommand(text, s, e, out)
+	for q := s; q < e; q++ {
+		if c := text[q]; c != '\'' && c != '"' {
+			continue
+		}
+		qe := strings.IndexByte(text[q+1:e], text[q])
+		end := e
+		if qe >= 0 {
+			end = q + 1 + qe
+		}
+		if w, _, _ := commandWord(text, q+1, end); mysqlFamily[w] || w == "sshpass" {
+			out = oneCommand(text, q+1, end, out)
+			q = end
+		}
+	}
+	return out
+}
+
+// commandWord returns the base name of the command word of text[s:e] and
+// its range, skipping blanks, '(' and wrappers (sudo with its options,
+// exec, time, nohup).
+func commandWord(text string, s, e int) (string, int, int) {
+	i := s
+	skipArg := false
+	for i < e {
+		for i < e && (text[i] == ' ' || text[i] == '\t' || text[i] == '(') {
+			i++
+		}
+		j := i
+		for j < e && text[j] != ' ' && text[j] != '\t' {
+			j++
+		}
+		if i >= j {
+			return "", i, i
+		}
+		tok := text[i:j]
+		switch {
+		case skipArg:
+			skipArg = false
+		case tok == "sudo" || tok == "exec" || tok == "time" || tok == "nohup":
+		case strings.HasPrefix(tok, "-") && i > s:
+			skipArg = tok == "-u" || tok == "-g" // sudo -u user
+		default:
+			return tok[strings.LastIndexByte(tok, '/')+1:], i, j
+		}
+		i = j
+	}
+	return "", e, e
+}
+
+// oneCommand reads the options of one command in text[s:e].
+func oneCommand(text string, s, e int, out []Span) []Span {
+	w, _, we := commandWord(text, s, e)
+	switch {
+	case mysqlFamily[w]:
+		return gluedOptions(text, we, e, true, out)
+	case w == "sshpass":
+		// sshpass's own options end at the command it runs.
+		i := we
+		for i < e {
+			for i < e && (text[i] == ' ' || text[i] == '\t') {
+				i++
 			}
-			if !strings.Contains(text[ls:le], "mysql") && !strings.Contains(text[ls:le], "mariadb") {
-				continue
+			if i >= e || text[i] != '-' {
+				break
+			}
+			for i < e && text[i] != ' ' && text[i] != '\t' {
+				i++
 			}
 		}
-		if sp, ok := valueSpan(text, m[4], m[5], k); ok {
+		out = gluedOptions(text, we, i, false, out)
+		return oneCommand(text, i, e, out)
+	}
+	return out
+}
+
+// gluedOptions reports glued -p (and with user, -u) option values in
+// text[s:e].
+func gluedOptions(text string, s, e int, user bool, out []Span) []Span {
+	for _, m := range gluedFlagRE.FindAllStringSubmatchIndex(text[s:e], -1) {
+		k := KindPassword
+		if text[s+m[2]:s+m[3]] == "u" {
+			if !user {
+				continue
+			}
+			k = KindUsername
+		}
+		vs, ve := valueGroup(m, 2)
+		if vs < 0 {
+			continue
+		}
+		vs, ve = vs+s, ve+s
+		v := text[vs:ve]
+		if strings.HasPrefix(v, "$") || strings.HasPrefix(v, "`") || portMapRE.MatchString(v) {
+			continue
+		}
+		if sp, ok := valueSpan(text, vs, ve, k); ok {
 			out = append(out, sp)
 		}
 	}

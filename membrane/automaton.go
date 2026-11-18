@@ -80,6 +80,9 @@ func atBoundary(text string, start, end int, mode boundMode) bool {
 	case boundLetters:
 		left, right = unicode.IsLetter, unicode.IsLetter
 	}
+	if mode == boundDigits && inDottedNumber(text, start, end) {
+		return false
+	}
 	if start > 0 {
 		if r, _ := utf8.DecodeLastRuneInString(text[:start]); left(r) {
 			return false
@@ -91,6 +94,16 @@ func atBoundary(text string, start, end int, mode boundMode) bool {
 		}
 	}
 	return true
+}
+
+// inDottedNumber reports whether text[start:end] is one group of a dotted
+// number (240 in 240.0.1.7 or 10.240.1.1, 1234 in v1.2.1234 or 1234.5): an
+// all-digit credential there is an address or version part, not a secret.
+func inDottedNumber(text string, start, end int) bool {
+	if start >= 2 && text[start-1] == '.' && text[start-2] >= '0' && text[start-2] <= '9' {
+		return true
+	}
+	return end+1 < len(text) && text[end] == '.' && text[end+1] >= '0' && text[end+1] <= '9'
 }
 
 type acNode struct {

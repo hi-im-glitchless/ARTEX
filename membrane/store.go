@@ -573,7 +573,9 @@ func (s *Store) enrollLocked(kind Kind, original string, prov Provenance, look b
 		s.mu.Lock()
 		s.indexEntry(ne)
 		s.mu.Unlock()
-		if remintKind(kind) {
+		if remintKind(kind) || (kind == KindDomain && isRootDomain(norm)) {
+			// A new client root may sit in the preserved labels of hosts
+			// minted before it (k.pt.acmebank.pt, then k.pt): re-mint them.
 			if err := s.remintForKeyword(norm); err != nil {
 				return "", err
 			}

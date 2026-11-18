@@ -188,25 +188,44 @@ func (e *Engine) transformPass(text string, prov Provenance, assistant bool) (st
 	if !assistant {
 		extra = append(extra, e.lookalikes(text)...)
 	}
-	var written [][2]int // replaced ranges in the output
-	for _, c := range mergeAdded(e.p.Detect(text), extra) {
+	// Minted aliases already in the text are protected: no detection inside
+	// one is replaced (a short secret "240" inside the IP alias 240.0.1.7).
+	prot := e.mintedOccurrences(text)
+	var spans []Span
+	for _, sp := range e.p.Detect(text) {
+		if !insideAny(prot, sp.Start, sp.End) {
+			spans = append(spans, sp)
+		}
+	}
+	// ranges: output ranges that exposedOriginals must not touch; written
+	// marks a replacement, the others are kept detections and minted aliases.
+	var ranges []outRange
+	copyRaw := func(from, to int) {
+		for _, p := range prot {
+			if p[0] >= from && p[1] <= to {
+				o := b.Len() + p[0] - from
+				ranges = append(ranges, outRange{o, o + p[1] - p[0], false})
+			}
+		}
+		b.WriteString(text[from:to])
+	}
+	for _, c := range mergeAdded(spans, extra) {
 		raw := text[c.Start:c.End]
 		repl, err := e.replacement(text, c, prov, &rep)
 		if err != nil {
 			return "", Report{}, err
 		}
+		copyRaw(last, c.Start)
 		if repl != raw {
 			rep.Counts[c.Kind]++
 		}
-		b.WriteString(text[last:c.Start])
-		if repl != raw {
-			written = append(written, [2]int{b.Len(), b.Len() + len(repl)})
-		}
+		ranges = append(ranges, outRange{b.Len(), b.Len() + len(repl), repl != raw})
 		b.WriteString(repl)
 		last = c.End
 	}
-	b.WriteString(text[last:])
-	out, err := e.exposedOriginals(b.String(), written, prov, &rep)
+	copyRaw(last, len(text))
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].s < ranges[j].s })
+	out, err := e.exposedOriginals(b.String(), ranges, prov, &rep)
 	if err != nil {
 		return "", Report{}, err
 	}
@@ -220,34 +239,93 @@ func (e *Engine) transformPass(text string, prov Provenance, assistant bool) (st
 	return out, rep, nil
 }
 
+// outRange is a range of the ToModel output: a replacement (written) or a
+// span kept as written (a detection that is already an alias, a minted
+// alias).
+type outRange struct {
+	s, e    int
+	written bool
+}
+
+func insideAny(rs [][2]int, s, e int) bool {
+	for _, r := range rs {
+		if r[0] <= s && e <= r[1] {
+			return true
+		}
+	}
+	return false
+}
+
+// mintedOccurrences returns the ranges of minted aliases in t: exact aliases
+// (reverse automaton, not as the left part of a third-party host) and
+// alias-shaped tokens that resolve (hosts under a minted domain alias,
+// addresses inside allocated blocks, known keyword and IPv6 aliases).
+func (e *Engine) mintedOccurrences(t string) [][2]int {
+	var out [][2]int
+	for _, m := range e.s.ReverseDictionary().FindAll(t) {
+		if e.hostSuffixOK(t, m) {
+			out = append(out, [2]int{m.Start, m.End})
+		}
+	}
+	for _, sh := range scanShapes(t) {
+		ok := false
+		switch sh.kind {
+		case shapeHost:
+			ok = e.underMintedDomain(sh.text)
+		case shapeIPv4:
+			_, ok = e.s.IPv4Real(netip.MustParseAddr(sh.text))
+		case shapeCIDR:
+			_, ok = e.s.CIDRReal(netip.MustParsePrefix(sh.text))
+			if !ok {
+				_, ok = e.s.IPv4Real(netip.MustParseAddr(sh.text[:strings.IndexByte(sh.text, '/')]))
+			}
+		case shapeIPv6:
+			_, _, ok = e.s.OriginalFor(netip.MustParseAddr(sh.text).String())
+		case shapeKeyword:
+			_, _, ok = e.s.OriginalFor(sh.text)
+		}
+		if ok {
+			out = append(out, [2]int{sh.Start, sh.End})
+		}
+	}
+	return out
+}
+
 // maxExposedRounds bounds exposedOriginals.
 const maxExposedRounds = 3
 
 // exposedOriginals aliases originals that a replacement exposed: the
 // boundary of a short single-class credential depends on its neighbours, so
 // "ACmeBAnkjsilva" (jsilva glued to letters, not matched) becomes
-// "ORG-3be1jsilva" (jsilva after a digit, matched). Dictionary matches in
-// out that lie wholly outside the replaced ranges are aliased; matches that
-// straddle a replaced range are juxtapositions of an alias with real text
-// and are left to LeakCheck (fail closed).
-func (e *Engine) exposedOriginals(out string, written [][2]int, prov Provenance, rep *Report) (string, error) {
+// "ORG-3be1jsilva" (jsilva after a digit, matched). Only a dictionary match
+// that touches the edge of a replacement and overlaps no range (replaced,
+// kept, or minted alias) is aliased: everything else was decided by the
+// pass itself. A match straddling a replacement is a juxtaposition of an
+// alias with real text and is left to LeakCheck (fail closed).
+func (e *Engine) exposedOriginals(out string, ranges []outRange, prov Provenance, rep *Report) (string, error) {
 	for round := 0; round < maxExposedRounds; round++ {
 		var fixes []Match
 	next:
 		for _, m := range e.s.Dictionary().FindAll(out) {
-			for _, w := range written {
-				if w[0] < m.End && m.Start < w[1] {
+			adjacent := false
+			for _, r := range ranges {
+				if r.s < m.End && m.Start < r.e {
 					continue next
 				}
+				if r.written && (r.e == m.Start || r.s == m.End) {
+					adjacent = true
+				}
 			}
-			fixes = append(fixes, m)
+			if adjacent {
+				fixes = append(fixes, m)
+			}
 		}
 		if len(fixes) == 0 {
 			return out, nil
 		}
 		var b strings.Builder
-		var moved [][2]int
-		last, delta, wi := 0, 0, 0
+		var moved []outRange
+		last, delta, ri := 0, 0, 0
 		for _, m := range fixes {
 			a, keep, err := e.aliasValue(m.Kind, m.Original, prov, rep)
 			if err != nil {
@@ -259,22 +337,22 @@ func (e *Engine) exposedOriginals(out string, written [][2]int, prov Provenance,
 			if isKeywordKind(m.Kind) && inHostToken(out, m.Start, m.End) {
 				a = strings.ToLower(a)
 			}
-			for ; wi < len(written) && written[wi][1] <= m.Start; wi++ {
-				moved = append(moved, [2]int{written[wi][0] + delta, written[wi][1] + delta})
+			for ; ri < len(ranges) && ranges[ri].e <= m.Start; ri++ {
+				moved = append(moved, outRange{ranges[ri].s + delta, ranges[ri].e + delta, ranges[ri].written})
 			}
 			b.WriteString(out[last:m.Start])
-			moved = append(moved, [2]int{b.Len(), b.Len() + len(a)})
+			moved = append(moved, outRange{b.Len(), b.Len() + len(a), true})
 			b.WriteString(a)
 			delta += len(a) - (m.End - m.Start)
 			last = m.End
 			rep.Counts[m.Kind]++
 		}
-		for ; wi < len(written); wi++ {
-			moved = append(moved, [2]int{written[wi][0] + delta, written[wi][1] + delta})
+		for ; ri < len(ranges); ri++ {
+			moved = append(moved, outRange{ranges[ri].s + delta, ranges[ri].e + delta, ranges[ri].written})
 		}
 		b.WriteString(out[last:])
-		out, written = b.String(), moved
-		sort.Slice(written, func(i, j int) bool { return written[i][0] < written[j][0] })
+		out, ranges = b.String(), moved
+		sort.Slice(ranges, func(i, j int) bool { return ranges[i].s < ranges[j].s })
 	}
 	return out, nil
 }
