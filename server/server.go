@@ -1544,6 +1544,10 @@ type createTaskReq struct {
 	// Credentials: test accounts declared at creation (#3). An empty password means
 	// "agent generates": the agent registers that account and records it back.
 	Credentials []taskCredentialReq `json:"credentials,omitempty"`
+	// ScopeKeywords: task-scope keyword rows declared at creation (the
+	// membrane preview's "Add as sensitive term"). They land before the task
+	// launches, so the first request already aliases them.
+	ScopeKeywords []string `json:"scope_keywords,omitempty"`
 }
 
 type taskCredentialReq struct {
@@ -1637,6 +1641,23 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 				Source: "user", Note: c.Note,
 			}); err != nil {
 				writeErr(w, 400, "invalid credential for "+c.Domain+": "+err.Error())
+				return
+			}
+		}
+	}
+	if len(req.ScopeKeywords) > 0 {
+		taskNum, _ := strconv.ParseInt(t.ID, 10, 64)
+		as := s.m.Assets()
+		if as == nil {
+			writeErr(w, 503, "asset store not enabled: scope keywords cannot be recorded")
+			return
+		}
+		for _, k := range req.ScopeKeywords {
+			if strings.TrimSpace(k) == "" {
+				continue
+			}
+			if _, err := as.AddAgentScope(taskNum, "keyword", k, "sensitive term (membrane preview)", "manual"); err != nil {
+				writeErr(w, 400, "invalid scope keyword: "+err.Error())
 				return
 			}
 		}

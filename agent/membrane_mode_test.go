@@ -61,6 +61,21 @@ func TestMembraneRequiredOverride(t *testing.T) {
 	}
 }
 
+// The profile badge reads the host rule alone: the override must not turn
+// a remote profile into "trusted local".
+func TestMembraneRequiredByHostIgnoresOverride(t *testing.T) {
+	t.Setenv("ARTEX_MEMBRANE", "off")
+	if !MembraneRequiredByHost("https://api.kimi.com/coding/v1") {
+		t.Fatal("the host rule must not apply the override")
+	}
+	if MembraneRequiredByHost("http://127.0.0.1:11434/v1") {
+		t.Fatal("loopback is trusted local")
+	}
+	if !MembraneRequiredByHost("http://gw.ai.layer8.int/v1") {
+		t.Fatal("hostnames other than localhost are remote")
+	}
+}
+
 func TestNewProviderFailsClosed(t *testing.T) {
 	t.Setenv("ARTEX_MEMBRANE", "")
 	c := ConfigFrom("anthropic", "m", "https://api.kimi.com/coding/v1", "k", "")

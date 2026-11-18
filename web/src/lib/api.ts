@@ -65,6 +65,11 @@ import type {
   LLMTask,
   MCPServer,
   MCPTool,
+  MembraneEventsPage,
+  MembranePreview,
+  MembranePreviewScopeRow,
+  MembraneStatus,
+  MembraneVerifyResult,
   MissingSkill,
   ModelTokenStat,
   NotificationChannel,
@@ -263,6 +268,7 @@ export const api = {
     coverageEnabled?: boolean;
     interceptRules?: AssetInterceptRuleInput[];
     credentials?: TaskCredentialInput[];
+    scopeKeywords?: string[];
   }) =>
     post<Task>("/tasks", {
       name: input.name ?? "",
@@ -278,6 +284,7 @@ export const api = {
       coverage_enabled: input.coverageEnabled ?? true, // on by default; false disables the asset coverage feature
       intercept_rules: input.interceptRules ?? [], // task-level asset interception rules
       credentials: input.credentials ?? [], // test accounts declared at creation; an empty password = the agent generates and records it (#3)
+      scope_keywords: input.scopeKeywords ?? [], // task-scope keyword rows (membrane preview "Add as sensitive term"), stored before the task launches
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
   updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
@@ -1310,6 +1317,57 @@ export const api = {
   // ledger, exact per call, covering per-agent bindings / pooling / interrupted spend).
   tokensByModel: (task: string) =>
     get<{ models: ModelTokenStat[] }>(`/llm/records/by-model?task=${encodeURIComponent(task)}`),
+
+  // ---- Identity membrane ----
+  // No route lists or looks up mapping entries (spec §12); these carry counts, kinds and hashes only.
+  membraneStatus: () => get<MembraneStatus>("/membrane/status"),
+  // Dry run of what the model would see for `text`. Nothing is enrolled or persisted server-side.
+  // The text is the operator's own; never log it.
+  membranePreview: (input: { text: string; companyIds: number[]; taskScope: MembranePreviewScopeRow[] }) =>
+    post<MembranePreview>("/membrane/preview", input).then((r) => ({
+      aliased: r.aliased ?? "",
+      spans: arr(r.spans),
+      suspicious: arr(r.suspicious),
+    })),
+  membraneEvents: (taskId: string, page = 1, size = 50) =>
+    get<MembraneEventsPage>(`/tasks/${encodeURIComponent(taskId)}/membrane/events?page=${page}&size=${size}`).then(
+      (r) => ({ ...r, events: arr(r.events) }),
+    ),
+  membraneVerify: (taskId: string) => post<MembraneVerifyResult>(`/tasks/${encodeURIComponent(taskId)}/membrane/verify`),
+  // Downloads the evidence export (md or json) using the backend's Content-Disposition filename.
+  membraneEvidence: async (taskId: string, format: "md" | "json") => {
+    const path = `/tasks/${encodeURIComponent(taskId)}/membrane/evidence?format=${format}`;
+    const fallbackName = `membrane-evidence-task-${taskId}.${format}`;
+    let blob: Blob;
+    let filename = fallbackName;
+    if (MOCK) {
+      blob = new Blob(["(demo) membrane evidence export is not available in demo mode."], { type: "text/plain" });
+    } else {
+      const token = getToken();
+      const r = await fetch(`/api${path}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+      if (!r.ok) {
+        let message = `evidence export: ${r.status}`;
+        try {
+          const payload = (await r.json()) as { error?: unknown };
+          if (typeof payload.error === "string" && payload.error.trim()) message = payload.error.trim();
+        } catch {
+          // keep the status fallback
+        }
+        throw new Error(message);
+      }
+      blob = await r.blob();
+      const m = (r.headers.get("Content-Disposition") ?? "").match(/filename="?([^"]+)"?/);
+      filename = m?.[1] ?? fallbackName;
+    }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
 
   // ---- One-click update ----
   // The backend arbitrates update checks: it does the downloading, and "the browser reaches

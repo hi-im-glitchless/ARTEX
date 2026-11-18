@@ -159,6 +159,43 @@ func TestPreviewDoesNotEnroll(t *testing.T) {
 	}
 }
 
+// A pending task-scope keyword (the create form's "Add as sensitive term")
+// is aliased in the preview without being enrolled.
+func TestPreviewTaskScopeKeyword(t *testing.T) {
+	f := newSeedFixture(t)
+	st := f.s.membraneStore()
+	// A per-run term: the shared test DB must not already know it.
+	term := fmt.Sprintf("Quorvex%d Holdings", time.Now().UnixNano()%1_000_000)
+	text := "Report to " + term + " by Friday."
+	beforeLen, beforeRows := st.Len(), countMembraneEntries(t, f.m)
+	call := func(scope any) previewResp {
+		t.Helper()
+		w := membraneAPICall(t, f.s, "POST", "/api/membrane/preview",
+			map[string]any{"text": text, "companyIds": []int64{}, "taskScope": scope})
+		if w.Code != 200 {
+			t.Fatalf("preview %d: %s", w.Code, w.Body)
+		}
+		var got previewResp
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	if got := call(nil); !strings.Contains(got.Aliased, term) {
+		t.Fatalf("an unknown term was aliased without scope: %q", got.Aliased)
+	}
+	got := call([]map[string]string{{"kind": "keyword", "value": term}, {"kind": "root_domain", "value": "ignored.example"}})
+	if strings.Contains(got.Aliased, "Quorvex") {
+		t.Fatalf("pending keyword not aliased: %q", got.Aliased)
+	}
+	if len(got.Spans) == 0 || got.Spans[0].Kind != "org" {
+		t.Fatalf("spans = %+v", got.Spans)
+	}
+	if st.Len() != beforeLen || countMembraneEntries(t, f.m) != beforeRows {
+		t.Fatalf("preview enrolled the pending keyword")
+	}
+}
+
 func TestDestroyRefusedWhileReferenced(t *testing.T) {
 	f := newSeedFixture(t)
 	if _, err := f.s.SyncTask(context.Background(), f.id()); err != nil {

@@ -2474,6 +2474,31 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       daily: [],
     };
 
+  // ── Identity membrane: an enabled membrane with no traffic in the demo ──
+  if (path === "/membrane/status") return { enabled: true, override: false, entries: 0, keys_source: "env" };
+  if (path === "/membrane/preview" && m === "POST")
+    return { aliased: typeof b.text === "string" ? b.text : "", spans: [], suspicious: [] };
+  if (seg[0] === "tasks" && seg[2] === "membrane") {
+    if (seg[3] === "events") return { events: [], total: 0, page: 1, size: 50 };
+    if (seg[3] === "verify")
+      return {
+        result: "pass",
+        checked: 0,
+        failed: 0,
+        failed_ids: [],
+        failed_kinds: {},
+        no_raw: 0,
+        unmembraned: 0,
+        blocked: 0,
+        forwarded: 0,
+        paired: 0,
+        unpaired: 0,
+        chain_ok: true,
+        reason: "no request was forwarded through the membrane for this task: nothing to re-scan",
+        note: "(demo) verification is not available in demo mode.",
+      };
+  }
+
   // ── Side questions (/btw): no side-question sessions in the demo ──
   // Must match explicitly: a path ending in s is treated as a collection by the read fallback below and returns [], leaving items undefined.
   if (seg.at(-1) === "side-questions") {

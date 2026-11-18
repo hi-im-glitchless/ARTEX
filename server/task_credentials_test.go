@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -108,5 +110,52 @@ func TestTaskCredentialsFlow(t *testing.T) {
 	resp = request("DELETE", fmt.Sprintf("/api/tasks/%s/credentials/999999", created.ID), "")
 	if resp.Code != http.StatusNotFound {
 		t.Fatalf("foreign credential delete must 404, got HTTP %d", resp.Code)
+	}
+}
+
+// scope_keywords (the membrane preview's "Add as sensitive term") become
+// manual task-scope keyword rows before the task launches.
+func TestCreateTaskScopeKeywords(t *testing.T) {
+	s, _, request := trafficEvidenceServer(t)
+	// A per-run term: the launched task may seed it into the shared test
+	// DB's membrane table (removed again below by task id).
+	term := fmt.Sprintf("Zorbexa%d Holdings", time.Now().UnixNano()%1_000_000)
+	resp := request("POST", "/api/tasks", `{
+		"description": "scope keyword test",
+		"goal": "Check the lab target at http://127.0.0.1:9/v1 for unauthenticated data exposure and record the outcome as evidence.",
+		"scope_keywords": ["`+term+`", "  "]
+	}`)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create failed, HTTP %d: %s", resp.Code, resp.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &created); err != nil || created.ID == "" {
+		t.Fatalf("bad create response: %s", resp.Body.String())
+	}
+	id, err := json.Number(created.ID).Int64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		s.m.PG().Exec(`DELETE FROM tasks WHERE id=$1`, id)
+		s.m.PG().Exec(`DELETE FROM membrane_entries WHERE $1::bigint = ANY(task_ids)`, id)
+	})
+	rows, err := s.m.Assets().ListTaskScope(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, r := range rows {
+		if r.Kind == "keyword" {
+			n++
+			if !strings.EqualFold(r.Value, term) || r.Source != "manual" {
+				t.Fatalf("keyword row = %+v", r)
+			}
+		}
+	}
+	if n != 1 {
+		t.Fatalf("want 1 keyword row, got %d: %+v", n, rows)
 	}
 }

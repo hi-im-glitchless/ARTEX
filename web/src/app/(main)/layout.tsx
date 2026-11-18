@@ -17,6 +17,7 @@ import { PREFERENCE_DEFAULTS } from "@/lib/preferences/preferences-config";
 import { cn } from "@/lib/utils";
 
 import { MainContent } from "./_components/main-content";
+import { MembraneBanner } from "./_components/membrane-banner";
 
 // Reads a layout-critical preference from the browser cookie (falls back to the
 // default during static-export prerender where document is unavailable). Kept
@@ -79,6 +80,7 @@ export default function Layout({ children }: Readonly<{ children: ReactNode }>) 
           "min-w-0 overflow-x-hidden",
         )}
       >
+        <MembraneBanner />
         <MainContent>{children}</MainContent>
       </SidebarInset>
     </SidebarProvider>

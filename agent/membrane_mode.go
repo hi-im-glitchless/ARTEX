@@ -67,6 +67,14 @@ func MembraneRequired(baseURL string) bool {
 	if MembraneOverride() {
 		return false
 	}
+	return MembraneRequiredByHost(baseURL)
+}
+
+// MembraneRequiredByHost is the host rule of MembraneRequired without the
+// override: true unless baseURL's host is a literal loopback, RFC 1918 or
+// ULA IP, or "localhost". The UI's per-profile badge reads it (the override
+// is shown separately), so the badge and the provider share one rule.
+func MembraneRequiredByHost(baseURL string) bool {
 	raw := strings.TrimSpace(baseURL)
 	if raw == "" {
 		return true

@@ -43,6 +43,15 @@ type previewRequest struct {
 	Text       string          `json:"text"`
 	CompanyIDs []int64         `json:"companyIds"`
 	TaskID     json.RawMessage `json:"taskId,omitempty"` // number or numeric string
+	// TaskScope holds task-scope rows not yet saved (the create form's
+	// pending sensitive terms). Only keyword and icp rows are seeded, as the
+	// real run seeds them from the task scope.
+	TaskScope []previewScopeRow `json:"taskScope,omitempty"`
+}
+
+type previewScopeRow struct {
+	Kind  string `json:"kind"`
+	Value string `json:"value"`
 }
 
 // PreviewSpan is a replaced value in the aliased text. Start and End are
@@ -128,6 +137,15 @@ func (s *Server) membranePreview(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		prov = membrane.Provenance{CompanyIDs: tc, TaskIDs: []int64{taskID}}
+	}
+	for _, row := range req.TaskScope {
+		if row.Kind != "keyword" && row.Kind != "icp" {
+			continue
+		}
+		if err := sd.keyword(row.Value, prov); err != nil {
+			writeErr(w, http.StatusInternalServerError, "preview: seed task scope failed")
+			return
+		}
 	}
 	out, _, err := dry.ToModel(req.Text, prov)
 	if err != nil {

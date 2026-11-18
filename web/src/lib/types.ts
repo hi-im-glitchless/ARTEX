@@ -1063,6 +1063,10 @@ export interface LLMProfile {
   session_header_key?: string;
   // This profile's retry overrides (connect / empty response / same-provider safety window). Empty / all zeros = follow the global policy.
   retry?: LLMRetryOverride;
+  // Identity membrane host rule for base_url, computed by the backend
+  // (agent.MembraneRequiredByHost, without the ARTEX_MEMBRANE override):
+  // true = remote, requests go through the membrane; false = trusted local endpoint.
+  membrane_required?: boolean;
 }
 
 // ---- LLM retry policy ----
@@ -1639,4 +1643,94 @@ export interface InterceptExecution {
   session: string;
   seq: number;
   items: Activity[];
+}
+
+// ---- Identity membrane (/api/membrane/*, /api/tasks/{id}/membrane/*) ----
+
+/** GET /api/membrane/status */
+export interface MembraneStatus {
+  enabled: boolean;
+  /** ARTEX_MEMBRANE=off is in force (audited): remote models receive real data. */
+  override: boolean;
+  entries: number;
+  keys_source: "env" | "file" | "generated" | "";
+  /** Why the membrane is not initialised (remote LLM calls are then refused). */
+  error?: string;
+  /** Last startup seed sync failure (non-fatal; each task syncs again before its requests). */
+  seed_error?: string;
+}
+
+/** Pending task-scope row sent with a preview (only keyword/icp rows are seeded). */
+export interface MembranePreviewScopeRow {
+  kind: "keyword" | "icp";
+  value: string;
+}
+
+/** A replaced value. start/end are UTF-16 indices into `aliased` (JS string indices). */
+export interface MembranePreviewSpan {
+  start: number;
+  end: number;
+  kind: string;
+  state: "replaced";
+}
+
+/** An unaliased token that looks like a name or a domain (UTF-16 indices into `aliased`). */
+export interface MembranePreviewSuspicious {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** POST /api/membrane/preview */
+export interface MembranePreview {
+  aliased: string;
+  spans: MembranePreviewSpan[];
+  suspicious: MembranePreviewSuspicious[];
+}
+
+/** One audit event (counts, kinds and hashes only; never originals). */
+export interface MembraneEvent {
+  id: number;
+  ts: string;
+  task_id: string;
+  session: string;
+  role: string;
+  profile: string;
+  direction: string;
+  counts: Record<string, number> | null;
+  enrolled: number;
+  flags: string[] | null;
+  blocked: boolean;
+  block_reason: string;
+  request_sha256: string;
+  prev_hash: string;
+  hash: string;
+}
+
+export interface MembraneEventsPage {
+  events: MembraneEvent[];
+  total: number;
+  page: number;
+  size: number;
+}
+
+/** POST /api/tasks/{id}/membrane/verify */
+export interface MembraneVerifyResult {
+  result: "pass" | "fail" | "inconclusive";
+  checked: number;
+  failed: number;
+  failed_ids: number[] | null;
+  failed_kinds: Record<string, number> | null;
+  no_raw: number;
+  unmembraned: number;
+  blocked: number;
+  forwarded: number;
+  paired: number;
+  unpaired: number;
+  chain_ok: boolean;
+  chain_first_bad_id?: number;
+  /** Explains fail / inconclusive / a vacuous pass (counts only). */
+  reason?: string;
+  /** Fixed caveat about re-scanning with today's dictionary; show verbatim. */
+  note: string;
 }
