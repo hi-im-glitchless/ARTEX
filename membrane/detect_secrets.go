@@ -25,6 +25,8 @@ func (secretDetector) Detect(text string) []Span {
 	out = secretFormats(text, low, out)
 	out = headerSecrets(text, out)
 	out = jsonKeySecrets(text, out)
+	out = jsonNumberSecrets(text, out)
+	out = htmlInputSecrets(text, out)
 	out = kvSecrets(text, out)
 	out = userinfoSecrets(text, out)
 	out = optionSecrets(text, out)
@@ -595,6 +597,9 @@ var keyQualifiers = map[string]bool{
 // keyKindWord classifies one name by the middlehack substring rules.
 func keyKindWord(key string) (Kind, bool) {
 	low := lowerASCII(key)
+	if low == "pin" || low == "pincode" {
+		return KindPassword, true // a PIN as a whole name (pin, otp_pin, pin_code)
+	}
 	hit := false
 	for _, a := range keyAnchors {
 		if strings.Contains(low, a) {
@@ -900,6 +905,13 @@ func headerSecrets(text string, out []Span) []Span {
 				out = authValue(text, vs, ve, out)
 				continue
 			}
+			// A passphrase is words: the whole value, to the end of line.
+			if strings.Contains(name, "passphrase") {
+				if sp, ok := valueSpan(text, vs, ve, k); ok {
+					out = append(out, sp)
+				}
+				continue
+			}
 			// Free-form "password: hunter2 (old)": the first word only.
 			e := vs
 			for e < ve && text[e] != ' ' && text[e] != '\t' {
@@ -1021,6 +1033,75 @@ func jsonKeySecrets(text string, out []Span) []Span {
 			continue
 		}
 		out = append(out, Span{Start: vs, End: ve, Kind: k, Value: dec, Encoding: EncJSONEscape})
+	}
+	return out
+}
+
+// jsonNumRE matches "key": 12345 pairs (unquoted integer values).
+var jsonNumRE = regexp.MustCompile(`"([A-Za-z0-9_.\-]{1,40})"\s*:\s*([0-9]{3,})(?:[\s,}\]]|$)`)
+
+// jsonNumberSecrets reports numeric values of secret-named JSON keys
+// ({"password": 83920174}, {"pin": 482913}). Only password and token keys:
+// numeric user ids are not enrolled (settleUserIDs).
+func jsonNumberSecrets(text string, out []Span) []Span {
+	for _, m := range lineMatches(jsonNumRE, text, lineHas(text, "\"")) {
+		k, ok := keyKind(text[m[2]:m[3]])
+		if !ok || (k != KindPassword && k != KindToken) {
+			continue
+		}
+		if sp, ok := valueSpan(text, m[4], m[5], k); ok {
+			out = append(out, sp)
+		}
+	}
+	return out
+}
+
+// HTML form fields: <input ... value="..."> whose name or id names a secret
+// (smtp_password, api-token, otp_pin) or whose type is password, attributes
+// in any order, the value double-, single- or un-quoted.
+var (
+	htmlInputRE = regexp.MustCompile(`(?i)<input\b[^>]*>`)
+	htmlAttrRE  = regexp.MustCompile(`([A-Za-z_:][A-Za-z0-9_:.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>` + "`" + `]+))`)
+)
+
+func htmlInputSecrets(text string, out []Span) []Span {
+	if !containsFoldASCII(text, "<input") {
+		return out
+	}
+	for _, t := range htmlInputRE.FindAllStringIndex(text, -1) {
+		var kind Kind
+		found := false
+		vs, ve := -1, -1
+		for _, a := range htmlAttrRE.FindAllStringSubmatchIndex(text[t[0]:t[1]], -1) {
+			name := lowerASCII(text[t[0]+a[2] : t[0]+a[3]])
+			s, e := valueGroup(a, 2)
+			if s < 0 {
+				continue
+			}
+			s, e = t[0]+s, t[0]+e
+			v := text[s:e]
+			switch name {
+			case "type":
+				if strings.EqualFold(v, "password") {
+					kind, found = KindPassword, true
+				}
+			case "name", "id":
+				if found {
+					continue
+				}
+				if k, ok := keyKind(v); ok && (k == KindPassword || k == KindToken) {
+					kind, found = k, true
+				}
+			case "value":
+				vs, ve = s, e
+			}
+		}
+		if !found || vs < 0 {
+			continue
+		}
+		if sp, ok := valueSpan(text, vs, ve, kind); ok {
+			out = append(out, sp)
+		}
 	}
 	return out
 }
