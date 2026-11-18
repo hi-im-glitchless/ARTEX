@@ -52,6 +52,9 @@ var (
 	gluedFlagRE = regexp.MustCompile(`(?:^|\s)-([pu])(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'|;&()]+))`)
 	portMapRE   = regexp.MustCompile(`^[0-9]+(?::[0-9]+)+$`)
 	promptRE    = regexp.MustCompile(`^[^\n]*?[$#>] `)
+	// historyRE: the event number a shell history listing puts before each
+	// command (bash/zsh `history`, `fc -l`: "  101  mysql -p...").
+	historyRE = regexp.MustCompile(`^[ \t]*[0-9]+\*?[ \t]+`)
 )
 
 // gluedFlagSpans reports -p<password> and -u<user> glued to a MySQL-family
@@ -77,6 +80,9 @@ func gluedFlagSpans(text string) []Span {
 			firstEnd = ls + seps[0][0]
 		}
 		if p := promptRE.FindStringIndex(text[ls:firstEnd]); p != nil {
+			out = commandFlags(text, ls+p[1], firstEnd, out)
+		}
+		if p := historyRE.FindStringIndex(text[ls:firstEnd]); p != nil {
 			out = commandFlags(text, ls+p[1], firstEnd, out)
 		}
 		for _, m := range seps {
