@@ -15,7 +15,7 @@ func TestGluedFlagHistoryListing(t *testing.T) {
 		assertAliased(t, e, in, "Kx81mq")
 	}
 	e, _ := newTestEngine(t)
-	for _, in := range []string{"  12  find /var/lib/mysql -user mysql -prune", "3 mysql servers -p"} {
+	for _, in := range []string{"  12  find /var/lib/mysql -user mysql -prune", "3 mysql servers -p", "  12  grep -pfoo mysql.log"} {
 		if out := toModel(t, e, in); out != in {
 			t.Fatalf("not a credential, but rewritten: %q -> %q", in, out)
 		}

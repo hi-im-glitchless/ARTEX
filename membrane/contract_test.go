@@ -55,6 +55,7 @@ type contractScope struct {
 	System           string      `json:"system"`
 	Goal             string      `json:"goal"`
 	Originals        []string    `json:"originals"`
+	Excluded         []string    `json:"excluded_originals"`
 	BasicCredentials [][2]string `json:"basic_credentials"`
 	NotEnrolled      []string    `json:"not_enrolled"`
 	NotRoots         []string    `json:"not_roots"`
@@ -436,6 +437,48 @@ func encodedForms(o string) []string {
 	return slices.Compact(forms)
 }
 
+// jsonStrings collects every string (keys included) of a decoded JSON value.
+func jsonStrings(v any, out []string) []string {
+	switch x := v.(type) {
+	case string:
+		out = append(out, x)
+	case []any:
+		for _, e := range x {
+			out = jsonStrings(e, out)
+		}
+	case map[string]any:
+		for k, e := range x {
+			out = append(out, k)
+			out = jsonStrings(e, out)
+		}
+	}
+	return out
+}
+
+var (
+	pctRE   = regexp.MustCompile(`%[0-9A-Fa-f]{2}`)
+	uescRE  = regexp.MustCompile(`\\u[0-9A-Fa-f]{4}`)
+	plainRE = regexp.MustCompile(`\\[/"\\]`)
+)
+
+// lenientUnescape percent-decodes every valid %XX and leaves the rest.
+func lenientUnescape(s string) string {
+	return pctRE.ReplaceAllStringFunc(s, func(m string) string {
+		b, _ := hex.DecodeString(m[1:])
+		return string(b)
+	})
+}
+
+// jsonUnescape decodes \uXXXX and \" \\ \/ escapes inside free text (a
+// JSON document quoted in a tool output).
+func jsonUnescape(s string) string {
+	s = uescRE.ReplaceAllStringFunc(s, func(m string) string {
+		b, _ := hex.DecodeString(m[2:])
+		return string(rune(int(b[0])<<8 | int(b[1])))
+	})
+	return plainRE.ReplaceAllStringFunc(s, func(m string) string { return m[1:] })
+}
+
 // assertNoOriginalForms is assertion 1 over one forwarded request.
 func assertNoOriginalForms(t *testing.T, e *Engine, sc contractScope, what string, raw []byte) {
 	t.Helper()
@@ -451,6 +494,18 @@ func assertNoOriginalForms(t *testing.T, e *Engine, sc contractScope, what strin
 		}
 	}
 	check("raw bytes", lower)
+	// Every JSON string of the request, URL- and HTML-decoded: catches an
+	// original written partly encoded (&#109;ferreira, ferreira%40acmebank).
+	var doc any
+	if json.Unmarshal(raw, &doc) == nil {
+		for _, s := range jsonStrings(doc, nil) {
+			for _, d := range []string{html.UnescapeString(s), lenientUnescape(s), html.UnescapeString(lenientUnescape(s)), jsonUnescape(s)} {
+				if d != s {
+					check("a URL/HTML-decoded string", strings.ToLower(d))
+				}
+			}
+		}
+	}
 	// Base64 forms: Basic credentials and every original.
 	var b64 []string
 	for _, c := range sc.BasicCredentials {
@@ -503,9 +558,22 @@ func TestContractConversation(t *testing.T) {
 	}
 	// Runtime values were learned from tool output and enrolled.
 	for _, o := range []string{"mferreira", "Lisboa#2025", "maria.ferreira@acmebank.pt",
-		"9f2c4e7a1b3d5f6081a2c4e6b8d0f1a3", "DbR00t!2024", "Winter!Pass99", "Joao Silva"} {
+		"9f2c4e7a1b3d5f6081a2c4e6b8d0f1a3", "DbR00t!2024", "Winter!Pass99", "svc_sync", "Joao Silva"} {
 		if _, _, ok := s.AliasFor(o); !ok {
-			t.Errorf("runtime original (len %d) was not enrolled", len(o))
+			t.Errorf("runtime original %q was not enrolled", o)
+		}
+	}
+	// Excluded originals (fixture: enrolled, R3-stoplisted, not client
+	// identifying) are deliberately outside the leak list.
+	for _, x := range sc.Excluded {
+		if slices.Contains(sc.Originals, x) {
+			t.Errorf("%q is both an original and excluded", x)
+		}
+		if _, _, ok := s.AliasFor(x); !ok {
+			t.Errorf("excluded value %q is expected to be enrolled", x)
+		}
+		if hits := e.LeakCheck([]byte("value " + x + " here")); len(hits) > 0 {
+			t.Errorf("excluded value %q is expected to be stoplisted from the leak dictionary", x)
 		}
 	}
 

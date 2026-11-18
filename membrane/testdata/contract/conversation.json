@@ -1,5 +1,5 @@
 {
-  "_comment": "Scripted synthetic transcript. 'input' is what the fake model emits (alias space, templates resolved from the request it received: {{a:X}} = the alias of X, which must be visible in that request; {{ip:X}} = the alias address of X; {{jwt}} = the JWT in the request; {{reason:N}} = the token of the N-th tool guard block reason in the request). 'expect' is the exact tool input the harness must execute (real values). 'result' is the real-space tool output fed back. 'blocked' calls must be refused by the tool guard and never executed.",
+  "_comment": "Scripted synthetic transcript; all names, credentials, IPs and domains are made-up placeholders. 'input' is what the fake model emits (alias space, templates resolved from the request it received: {{a:X}} = the alias of X, which must be visible in that request; {{ip:X}} = the alias address of X; {{jwt}} = the JWT in the request; {{reason:N}} = the token of the N-th tool guard block reason in the request). 'expect' is the exact tool input the harness must execute (real values). 'result' is the real-space tool output fed back. 'blocked' calls must be refused by the tool guard and never executed.",
   "steps": [
     {
       "label": "host listing",
@@ -42,6 +42,17 @@
           "input": {"method": "POST", "url": "https://{{a:portal.acmebank.pt}}/api/login", "body": "{\"username\":\"{{a:mferreira}}\",\"password\":\"{{a:Lisboa#2025}}\"}"},
           "expect": {"method": "POST", "url": "https://portal.acmebank.pt/api/login", "body": "{\"username\":\"mferreira\",\"password\":\"Lisboa#2025\"}"},
           "result": "> GET /api/profile HTTP/1.1\r\n> Host: portal.acmebank.pt\r\n> Authorization: Basic bWZlcnJlaXJhOkxpc2JvYSMyMDI1\r\n>\r\n< HTTP/1.1 200 OK\r\n<\r\n{\"user\":\"maria.ferreira@acmebank.pt\"}"
+        }
+      ]
+    },
+    {
+      "label": "redirect and page",
+      "calls": [
+        {
+          "tool": "bash",
+          "input": {"command": "curl -si https://{{a:portal.acmebank.pt}}/account"},
+          "expect": {"command": "curl -si https://portal.acmebank.pt/account"},
+          "result": "HTTP/1.1 302 Found\r\nLocation: https://portal.acmebank.pt/reset?email=maria.ferreira%40acmebank.pt&u=mferreira\r\n\r\n<html><body><p>Owner: &#109;ferreira at acmebank&#46;pt</p><form><input name=\"password\" value=\"Lisboa&#35;2025\"></form></body></html>\nform body: username=mferreira&password=Lisboa%232025\nprofile: {\"contact\":\"maria.ferreira\\u0040acmebank.pt\"}\n"
         }
       ]
     },
