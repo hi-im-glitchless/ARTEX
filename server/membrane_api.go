@@ -238,9 +238,10 @@ func (s *Server) membraneTaskEvents(w http.ResponseWriter, r *http.Request) {
 	if page < 1 {
 		page = 1
 	}
-	if size < 1 || size > 500 {
+	if size < 1 {
 		size = 50
 	}
+	size = min(size, 500)
 	evs, total, err := s.m.pg.ListMembraneEvents(id, page, size)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "list membrane events failed")

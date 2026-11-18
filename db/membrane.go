@@ -379,9 +379,10 @@ func (d *DB) ListMembraneEvents(taskID string, page, size int) ([]MembraneEvent,
 	if page < 1 {
 		page = 1
 	}
-	if size < 1 || size > 500 {
+	if size < 1 {
 		size = 50
 	}
+	size = min(size, 500)
 	var total int
 	if err := d.QueryRow(`SELECT count(*) FROM membrane_events WHERE ($1='' OR task_id=$1)`, taskID).Scan(&total); err != nil {
 		return nil, 0, err
