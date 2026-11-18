@@ -1,6 +1,9 @@
 package membrane
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // Task 6 carried fix: user/login/account name keys and remaining credential
 // key spellings.
@@ -62,6 +65,23 @@ func TestNumericIDValuesNotEnrolled(t *testing.T) {
 	} {
 		e, _ := newTestEngine(t)
 		assertAliased(t, e, c.in, c.secret)
+	}
+}
+
+func TestGitConfigCRLFAndComments(t *testing.T) {
+	for _, c := range []struct{ in, secret string }{
+		{"[user]\r\n\tname = João Silva\r\n\temail = x@example.org\r\n", "João Silva"},
+		{"[user]\n\tname = João Silva # work\n", "João Silva"},
+		{"[user]\n\tname = \"Maria Costa\" ; old\n", "Maria Costa"},
+		{"[user]\r\n\tname = joao\r\n", "joao"},
+	} {
+		e, _ := newTestEngine(t)
+		assertAliased(t, e, c.in, c.secret)
+	}
+	e, _ := newTestEngine(t)
+	out := toModel(t, e, "[user]\n\tname = João Silva # work\n")
+	if !strings.HasSuffix(out, " # work\n") {
+		t.Fatalf("comment swallowed: %q", out)
 	}
 }
 

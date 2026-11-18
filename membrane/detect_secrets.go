@@ -493,9 +493,17 @@ func gitNameSpans(text string, out []Span) []Span {
 		case inUser:
 			if k, _, ok := strings.Cut(line, "="); ok && strings.EqualFold(strings.TrimSpace(k), "name") {
 				vs := ls + strings.Index(text[ls:le], "=") + 1
-				vs, ve := trimSpaces(text, vs, le)
-				if ve-vs >= 2 && (text[vs] == '"' || text[vs] == '\'') && text[ve-1] == text[vs] {
-					vs, ve = vs+1, ve-1
+				ve := le
+				if ve > vs && text[ve-1] == '\r' {
+					ve-- // CRLF line ending
+				}
+				vs, ve = trimSpaces(text, vs, ve)
+				if vs < ve && (text[vs] == '"' || text[vs] == '\'') {
+					if c := strings.IndexByte(text[vs+1:ve], text[vs]); c >= 0 {
+						vs, ve = vs+1, vs+1+c // quoted: a trailing comment follows the quote
+					}
+				} else if c := strings.IndexAny(text[vs:ve], "#;"); c > 0 && (text[vs+c-1] == ' ' || text[vs+c-1] == '\t') {
+					_, ve = trimSpaces(text, vs, vs+c) // unquoted: stop before " #" / " ;"
 				}
 				if vs < ve {
 					if sp, ok := valueSpan(text, vs, ve, KindPerson); ok {
