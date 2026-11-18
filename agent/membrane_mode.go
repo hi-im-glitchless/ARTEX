@@ -1,0 +1,60 @@
+package agent
+
+import (
+	"errors"
+	"net/netip"
+	"net/url"
+	"os"
+	"strings"
+)
+
+// MembraneEnv is the only override of the identity membrane: the exact value
+// "off" disables it for every profile (spec §9.4). It needs host access, so
+// it is not a UI switch.
+const MembraneEnv = "ARTEX_MEMBRANE"
+
+// ErrMembraneNotInitialised is returned by NewProvider when the base URL
+// needs the membrane but the config carries no engine or auditor (for
+// example because the store failed to open). No request is possible.
+var ErrMembraneNotInitialised = errors.New("membrane required but not initialised")
+
+// MembraneOverride reports whether ARTEX_MEMBRANE=off is set.
+func MembraneOverride() bool { return os.Getenv(MembraneEnv) == "off" }
+
+// membraneRequiredFn is the test hook NewProvider consults (tests force it
+// to true for a local httptest server).
+var membraneRequiredFn = MembraneRequired
+
+// MembraneRequired reports whether a provider at baseURL must go through the
+// membrane. Trust is derived, not set: it is false only when the host is a
+// literal loopback, RFC 1918 or ULA IP, or "localhost", or when the override
+// is active. Hostnames other than localhost are never resolved, an empty base
+// URL (the provider's default endpoint) is remote, and anything unparsable is
+// remote (fail closed).
+func MembraneRequired(baseURL string) bool {
+	if MembraneOverride() {
+		return false
+	}
+	raw := strings.TrimSpace(baseURL)
+	if raw == "" {
+		return true
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return true
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return false
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil || addr.Zone() != "" {
+		return true
+	}
+	addr = addr.Unmap()
+	// IsPrivate covers 10/8, 172.16/12, 192.168/16 and fc00::/7 (ULA).
+	return !(addr.IsLoopback() || addr.IsPrivate())
+}

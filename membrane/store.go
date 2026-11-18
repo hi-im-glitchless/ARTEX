@@ -945,6 +945,13 @@ func (s *Store) OriginalFor(alias string) (original string, kind Kind, ok bool) 
 	return "", "", false
 }
 
+// Len returns the number of enrolled entries.
+func (s *Store) Len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.byKey)
+}
+
 // Roots returns the enrolled real root domains (eTLD+1), sorted.
 func (s *Store) Roots() []string {
 	s.mu.RLock()

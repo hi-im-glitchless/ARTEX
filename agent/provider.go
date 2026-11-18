@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/llmrec"
+	"github.com/Autumn-27/artex/membrane"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
@@ -88,6 +89,14 @@ type Config struct {
 	// global policy → built-in default, resolved server-side). See RetryConfig for
 	// the per-layer semantics; zero values = fully inherit the built-in defaults.
 	Retry RetryConfig
+	// Membrane and MembraneAudit wrap every provider whose base URL is not a
+	// trusted local model (see MembraneRequired) in the identity membrane.
+	// When the membrane is required and either is nil, NewProvider fails
+	// closed with ErrMembraneNotInitialised. ProfileName is recorded in the
+	// membrane's audit events.
+	Membrane      *membrane.Engine
+	MembraneAudit membrane.Auditor
+	ProfileName   string
 }
 
 // RetryConfig holds the retry parameters that travel with one LLM config. The
@@ -271,7 +280,17 @@ func (c Config) Provider() string {
 // NewProvider builds an llm.Provider from the config. When a rate is set, the
 // limiter lives on the single provider instance — so planner + all workers +
 // main agent (which share this provider) are bounded by one shared rate limit.
+//
+// Every provider whose base URL is not a trusted local model is wrapped in the
+// identity membrane (spec §5.1, §9.4). The wrap sits below llmrec and llmpool,
+// so llmrec's raw wire capture holds aliased bytes while its RequestBody stays
+// real. Without an engine and an auditor such a provider is not built at all
+// (fail closed).
 func (c Config) NewProvider() (llm.Provider, error) {
+	required := membraneRequiredFn(c.BaseURL)
+	if required && (c.Membrane == nil || c.MembraneAudit == nil) {
+		return nil, ErrMembraneNotInitialised
+	}
 	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey)
 	if err != nil {
 		return nil, err
@@ -301,7 +320,11 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	if c.RatePerSecond > 0 || c.RatePerMinute > 0 {
 		lc.RateLimit = &llm.RateLimit{PerSecond: c.RatePerSecond, PerMinute: c.RatePerMinute}
 	}
-	return llm.NewProvider(lc)
+	prov, err := llm.NewProvider(lc)
+	if err != nil || !required {
+		return prov, err
+	}
+	return membrane.Wrap(prov, c.Membrane, c.MembraneAudit, c.ProfileName), nil
 }
 
 // IsQuotaExhaustedMessage deliberately recognizes only explicit balance,

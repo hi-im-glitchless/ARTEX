@@ -119,6 +119,8 @@ type Server struct {
 	archiveWake chan struct{}
 	archiveWG   sync.WaitGroup
 	side        *sideQuestionState
+
+	mem membraneState // identity membrane, built in New before any provider
 }
 
 // provEntry is a cached provider + its config for one LLM profile id.
@@ -151,6 +153,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+	s.initMembrane(keyDir) // before any provider is built
 	s.initSideQuestions()
 	// Circuit-breaker thresholds/cooldowns are hot parameters on the failure path; push the global retry policy to the Registry once at startup,
 	// and again on every policy save (saveLLMRetryPolicy).
@@ -335,6 +338,7 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	s.applyProfileRetry(&cfg, p)
+	s.attachMembrane(&cfg, p.Name)
 	if cfg.APIKey == "" {
 		return cfg, false
 	}
@@ -436,15 +440,16 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 		}
 	}
 	if prov == nil {
+		// Non-persisted/env configs do not have a profile cache key.
+		s.cfgMu.Lock()
+		profName := s.llmProf
+		s.cfgMu.Unlock()
+		s.attachMembrane(&cfg, profName)
 		var err error
 		prov, err = cfg.NewProvider()
 		if err != nil {
 			return err
 		}
-		// Non-persisted/env configs do not have a profile cache key.
-		s.cfgMu.Lock()
-		profName := s.llmProf
-		s.cfgMu.Unlock()
 		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, profName, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
 		prov = bindSideProvider(prov, cfg, 0, profName)
 	}
@@ -506,6 +511,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	s.applyProfileRetry(&cfg, p)
+	s.attachMembrane(&cfg, p.Name)
 	if cfg.APIKey == "" {
 		return cfg, false
 	}
@@ -1360,6 +1366,7 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Validate provider construction before persisting it as the active profile.
+	s.attachMembrane(&cfg, "")
 	if _, err := cfg.NewProvider(); err != nil {
 		writeErr(w, 400, "provider init failed: "+err.Error())
 		return
@@ -1474,6 +1481,11 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// Retry params do [not] go into the connection test: the test has a 30s hard timeout, and stacking the configured retry counts/long intervals on top
 	// would only turn a perfectly usable endpoint into a "timeout failure". The test asks "does this endpoint work at all"; retry pacing
 	// is a runtime concern.
+	testProfile := ""
+	if stored != nil {
+		testProfile = stored.Name
+	}
+	s.attachMembrane(&cfg, testProfile) // the connection test goes through the membrane too
 	lat, reply, err := agent.TestConnection(r.Context(), cfg)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
