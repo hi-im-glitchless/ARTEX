@@ -106,6 +106,9 @@ func (p *Pipeline) Detect(text string) []Span {
 				if !ok {
 					continue
 				}
+				if isCredentialKind(c.Kind) && placeholderValue(text[c.Start:c.End]) {
+					continue // a placeholder as written (%DB_PASSWORD%), mis-decoded by the view
+				}
 				// Views rank after raw text, in Encoding order.
 				cands = append(cands, candidate{Span: c, prio: int(v.enc)*len(dets) + di})
 			}

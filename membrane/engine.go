@@ -188,6 +188,7 @@ func (e *Engine) transformPass(text string, prov Provenance, assistant bool) (st
 	if !assistant {
 		extra = append(extra, e.lookalikes(text)...)
 	}
+	var written [][2]int // replaced ranges in the output
 	for _, c := range mergeAdded(e.p.Detect(text), extra) {
 		raw := text[c.Start:c.End]
 		repl, err := e.replacement(text, c, prov, &rep)
@@ -198,11 +199,17 @@ func (e *Engine) transformPass(text string, prov Provenance, assistant bool) (st
 			rep.Counts[c.Kind]++
 		}
 		b.WriteString(text[last:c.Start])
+		if repl != raw {
+			written = append(written, [2]int{b.Len(), b.Len() + len(repl)})
+		}
 		b.WriteString(repl)
 		last = c.End
 	}
 	b.WriteString(text[last:])
-	out := b.String()
+	out, err := e.exposedOriginals(b.String(), written, prov, &rep)
+	if err != nil {
+		return "", Report{}, err
+	}
 	for _, sp := range e.Suspicious(out) {
 		if strings.ContainsAny(sp.Text, " \t") {
 			rep.Flags = unionSorted(rep.Flags, []string{"suspicious_name"})
@@ -211,6 +218,65 @@ func (e *Engine) transformPass(text string, prov Provenance, assistant bool) (st
 		}
 	}
 	return out, rep, nil
+}
+
+// maxExposedRounds bounds exposedOriginals.
+const maxExposedRounds = 3
+
+// exposedOriginals aliases originals that a replacement exposed: the
+// boundary of a short single-class credential depends on its neighbours, so
+// "ACmeBAnkjsilva" (jsilva glued to letters, not matched) becomes
+// "ORG-3be1jsilva" (jsilva after a digit, matched). Dictionary matches in
+// out that lie wholly outside the replaced ranges are aliased; matches that
+// straddle a replaced range are juxtapositions of an alias with real text
+// and are left to LeakCheck (fail closed).
+func (e *Engine) exposedOriginals(out string, written [][2]int, prov Provenance, rep *Report) (string, error) {
+	for round := 0; round < maxExposedRounds; round++ {
+		var fixes []Match
+	next:
+		for _, m := range e.s.Dictionary().FindAll(out) {
+			for _, w := range written {
+				if w[0] < m.End && m.Start < w[1] {
+					continue next
+				}
+			}
+			fixes = append(fixes, m)
+		}
+		if len(fixes) == 0 {
+			return out, nil
+		}
+		var b strings.Builder
+		var moved [][2]int
+		last, delta, wi := 0, 0, 0
+		for _, m := range fixes {
+			a, keep, err := e.aliasValue(m.Kind, m.Original, prov, rep)
+			if err != nil {
+				return "", err
+			}
+			if keep {
+				a = out[m.Start:m.End]
+			}
+			if isKeywordKind(m.Kind) && inHostToken(out, m.Start, m.End) {
+				a = strings.ToLower(a)
+			}
+			for ; wi < len(written) && written[wi][1] <= m.Start; wi++ {
+				moved = append(moved, [2]int{written[wi][0] + delta, written[wi][1] + delta})
+			}
+			b.WriteString(out[last:m.Start])
+			moved = append(moved, [2]int{b.Len(), b.Len() + len(a)})
+			b.WriteString(a)
+			delta += len(a) - (m.End - m.Start)
+			last = m.End
+			rep.Counts[m.Kind]++
+		}
+		for ; wi < len(written); wi++ {
+			moved = append(moved, [2]int{written[wi][0] + delta, written[wi][1] + delta})
+		}
+		b.WriteString(out[last:])
+		out, written = b.String(), moved
+		sort.Slice(written, func(i, j int) bool { return written[i][0] < written[j][0] })
+	}
+	return out, nil
 }
 
 // replacement returns the text written over candidate c.

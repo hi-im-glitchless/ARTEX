@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
@@ -117,6 +118,10 @@ type Store struct {
 	rdict      *Automaton // reverse (alias -> original) automaton
 	rdictGen   uint64     // aliasGen rdict was built at
 	modelKnown map[string]bool
+	// phones by international core digits (no +/00 prefix) of the original
+	// and of the alias, for the digits-only / + / 00 variants.
+	phoneOrig  map[string]*entry
+	phoneAlias map[string]*entry
 
 	// gen counts every change that can alter a transform's output
 	// (enrolment, re-mint, block allocation, model-known marks, reload).
@@ -256,6 +261,7 @@ func (s *Store) reload() error {
 	s.mu.Lock()
 	s.byKey, s.origSens, s.origFold = fresh.byKey, fresh.origSens, fresh.origFold
 	s.aliasExact, s.aliasFold, s.roots = fresh.aliasExact, fresh.aliasFold, fresh.roots
+	s.phoneOrig, s.phoneAlias = fresh.phoneOrig, fresh.phoneAlias
 	s.blocks = fresh.blocks
 	s.dict, s.dictDirty = nil, true
 	s.gen.Add(1)
@@ -271,6 +277,8 @@ func (s *Store) resetMaps() {
 	s.aliasExact = map[string]*entry{}
 	s.aliasFold = map[string]*entry{}
 	s.roots = map[string]string{}
+	s.phoneOrig = map[string]*entry{}
+	s.phoneAlias = map[string]*entry{}
 }
 
 // indexEntry adds e to the maps. Caller holds mu (or owns s exclusively).
@@ -290,9 +298,84 @@ func (s *Store) indexEntry(e *entry) {
 	if e.kind == KindDomain && isRootDomain(e.norm) {
 		s.roots[e.norm] = e.alias
 	}
+	if e.kind == KindPhone {
+		if oc, ac, ok := phoneCores(e); ok {
+			s.phoneOrig[oc] = e
+			s.phoneAlias[ac] = e
+		}
+	}
 	s.dictDirty = true
 	s.gen.Add(1)
 	s.aliasGen.Add(1)
+}
+
+// Phone variants. An international phone (+351 912 345 678, 00351912345678)
+// is also written digits-only (351912345678), with + or with 00. Each such
+// variant of the original maps to the same variant of the alias (the
+// format-preserving alias keeps the digit positions), and back: the form
+// that appeared is the form produced, in both directions.
+
+// phoneCore returns the international core digits of v when v is a phone
+// written with a + or 00 prefix, or digits only, with separators only; and
+// the variant form (0 digits only, 1 "+", 2 "00").
+func phoneCore(v string) (core string, form int, ok bool) {
+	t := strings.TrimSpace(v)
+	for _, r := range t {
+		if !(r >= '0' && r <= '9') && !strings.ContainsRune("+ -.()", r) {
+			return "", 0, false
+		}
+	}
+	d := onlyDigits(t)
+	switch {
+	case strings.HasPrefix(t, "+"):
+		core, form = d, 1
+	case strings.HasPrefix(t, "00"):
+		core, form = d[2:], 2
+	default:
+		core, form = d, 0
+	}
+	return core, form, len(core) >= 9
+}
+
+// phoneCores returns the core digits of a phone entry's original and alias.
+// Only originals written with an international prefix have variants.
+func phoneCores(e *entry) (orig, alias string, ok bool) {
+	oc, form, ok := phoneCore(e.original)
+	if !ok || form == 0 {
+		return "", "", false
+	}
+	ad := onlyDigits(e.alias)
+	if form == 2 && len(ad) >= 2 {
+		ad = ad[2:]
+	}
+	return oc, ad, len(ad) == len(oc)
+}
+
+// phoneForm writes core in variant form f.
+func phoneForm(core string, f int) string {
+	switch f {
+	case 1:
+		return "+" + core
+	case 2:
+		return "00" + core
+	}
+	return core
+}
+
+// phoneVariants lists the variant forms of a phone entry as pairs
+// {original form, alias form}; the entry's own spelling is left out.
+func phoneVariants(e *entry) [][2]string {
+	oc, ac, ok := phoneCores(e)
+	if !ok {
+		return nil
+	}
+	var out [][2]string
+	for f := 0; f < 3; f++ {
+		if o := phoneForm(oc, f); o != e.original {
+			out = append(out, [2]string{o, phoneForm(ac, f)})
+		}
+	}
+	return out
 }
 
 // indexAlias makes a (current or retired) resolve to e. Caller holds mu.
@@ -780,6 +863,10 @@ func (s *Store) AliasFor(original string) (alias string, kind Kind, ok bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if e := s.entryForLocked(original); e != nil {
+		if core, f, ok := phoneCore(original); ok && e.kind == KindPhone && original != e.original && s.phoneOrig[core] == e {
+			_, ac, _ := phoneCores(e)
+			return phoneForm(ac, f), KindPhone, true // the variant written
+		}
 		return e.alias, e.kind, true
 	}
 	return "", "", false
@@ -802,6 +889,11 @@ func (s *Store) entryForLocked(original string) *entry {
 	}
 	if a, err := netip.ParseAddr(t); err == nil {
 		if e := s.origSens[a.Unmap().String()]; e != nil {
+			return e
+		}
+	}
+	if core, _, ok := phoneCore(t); ok {
+		if e := s.phoneOrig[core]; e != nil {
 			return e
 		}
 	}
@@ -841,6 +933,12 @@ func (s *Store) OriginalFor(alias string) (original string, kind Kind, ok bool) 
 	t := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(alias)), ".")
 	if e := s.aliasFold[t]; e != nil {
 		return e.original, e.kind, true
+	}
+	if core, f, ok := phoneCore(alias); ok {
+		if e := s.phoneAlias[core]; e != nil {
+			oc, _, _ := phoneCores(e)
+			return phoneForm(oc, f), KindPhone, true
+		}
 	}
 	return "", "", false
 }
@@ -923,16 +1021,39 @@ func patternBound(k Kind, text string) boundMode {
 	case k == KindEmail:
 		return boundEmail
 	case isCredentialKind(k) && utf8.RuneCountInString(text) < shortCredentialMax:
-		return boundToken
+		return classBound(text)
+	case k == KindPhone:
+		return boundDigits
 	}
 	return boundNone
 }
 
 // shortCredentialMax: usernames, passwords and tokens shorter than this
-// (in runes) match only as whole tokens, forward, in the leak check and in
-// reverse; a short value or its alias occurs by chance inside other words
-// and numbers (bob in bobby, 1234 in 12345).
+// (in runes) that consist of one character class only must not touch more
+// of that class, forward, in the leak check and in reverse: a short value
+// or its alias occurs by chance inside other words and numbers (bob in
+// bobby, 1234 in 12345). Against the other class they still match (-p1234,
+// bob123). Mixed-class short values (abc123x) match anywhere: they do not
+// occur by chance. Format-preserving aliases keep the classes, so both
+// directions use the same rule.
 const shortCredentialMax = 8
+
+// classBound picks boundDigits for an all-digit value, boundLetters for an
+// all-letter one, and boundNone otherwise.
+func classBound(text string) boundMode {
+	digits, letters := true, true
+	for _, r := range text {
+		digits = digits && unicode.IsDigit(r)
+		letters = letters && unicode.IsLetter(r)
+	}
+	switch {
+	case digits:
+		return boundDigits
+	case letters:
+		return boundLetters
+	}
+	return boundNone
+}
 
 func isCredentialKind(k Kind) bool {
 	return k == KindUsername || k == KindPassword || k == KindToken
@@ -958,6 +1079,10 @@ func (s *Store) patternsLocked() []acPattern {
 			continue
 		}
 		add(e, e.original)
+		for _, v := range phoneVariants(e) {
+			pats = append(pats, acPattern{text: v[0], original: v[0], kind: e.kind, alias: v[1],
+				caseSensitive: true, bound: boundDigits})
+		}
 		if e.kind == KindDomain {
 			if u, err := idna.Punycode.ToUnicode(e.norm); err == nil && u != e.norm {
 				add(e, u)
@@ -1013,6 +1138,10 @@ func (s *Store) reversePatternsLocked() []acPattern {
 			}
 			pats = append(pats, acPattern{text: a, original: e.original, kind: e.kind, alias: a,
 				caseSensitive: !foldKind(e.kind), bound: bound})
+		}
+		for _, v := range phoneVariants(e) {
+			pats = append(pats, acPattern{text: v[1], original: v[0], kind: e.kind, alias: v[1],
+				caseSensitive: true, bound: boundDigits})
 		}
 	}
 	return pats

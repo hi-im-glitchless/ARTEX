@@ -90,8 +90,10 @@ func TestShortCredentialsMatchAsTokens(t *testing.T) {
 		}
 	}
 	pa, ua := mustAlias(t, s, "1234"), mustAlias(t, s, "bob")
-	// Forward: no match inside longer words or numbers.
-	if out := toModel(t, e, "bobby 12345 x1234 bob"); out != "bobby 12345 x1234 "+ua {
+	// Forward: a single-class short value does not match inside a longer run
+	// of its own class (bobby, 12345); against the other class it does
+	// (x1234: digits after a letter).
+	if out := toModel(t, e, "bobby 12345 x1234 bob"); out != "bobby 12345 x"+pa+" "+ua {
 		t.Fatalf("forward %q", out)
 	}
 	if len(e.LeakCheck([]byte("bobby 12345"))) != 0 {

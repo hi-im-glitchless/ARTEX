@@ -78,6 +78,13 @@ func (e *Engine) toReal(text string, depth int) (string, []string) {
 		cands = append(cands, e.deriveShape(sh))
 	}
 	cands = append(cands, e.jwtCandidates(text)...)
+	for _, sp := range gluedFlagSpans(text) {
+		// -p<alias> / -u<alias>: the alias is glued to the option letter,
+		// which the class-bound reverse automaton does not match.
+		if orig, _, ok := e.s.OriginalFor(sp.Value); ok {
+			cands = append(cands, rCand{Start: sp.Start, End: sp.End, repl: orig, prio: prioToken})
+		}
+	}
 	if depth == 0 {
 		cands = append(cands, e.basicCandidates(text, depth)...)
 	}
@@ -112,14 +119,35 @@ func (e *Engine) toReal(text string, depth int) (string, []string) {
 	return b.String(), unresolved
 }
 
-// hostSuffixOK rejects a domain or email alias match that does not end its
-// host: in evil.ffcc79.example.attacker.com or ffcc79.example.evil.com the
-// alias is a label sequence of someone else's host, not client space.
+// hostSuffixOK rejects a domain or email alias match that is the left part
+// of a third-party host: in evil.ffcc79.example.attacker.com or
+// ffcc79.example.evil.com the continuation (attacker.com, evil.com) is a
+// registrable domain, so the alias is a label sequence of someone else's
+// host, not client space. A continuation that is not a registrable domain
+// is a file extension or similar (ffcc79.example.crt, .conf, .nmap, .xml,
+// a lone .com) and the alias resolves, matching the forward direction,
+// which aliases a domain followed by '.'.
 func hostSuffixOK(t string, m Match) bool {
 	if m.Kind != KindDomain && m.Kind != KindEmail {
 		return true
 	}
-	return !(byteAfter(t, m.End) == '.' && isHostByte(byteAfter(t, m.End+1)))
+	if byteAfter(t, m.End) != '.' {
+		return true
+	}
+	e := m.End + 1
+	for e < len(t) && (isHostByte(t[e]) || t[e] == '.') {
+		e++
+	}
+	rest := strings.ToLower(strings.TrimRight(t[m.End+1:e], "."))
+	if !strings.Contains(rest, ".") {
+		return true
+	}
+	_, err := publicsuffix.EffectiveTLDPlusOne(rest)
+	if err != nil {
+		return true
+	}
+	_, icann := publicsuffix.PublicSuffix(rest)
+	return !icann
 }
 
 // reverseText is the original for alias match m written as matched. A

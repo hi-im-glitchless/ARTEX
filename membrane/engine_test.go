@@ -605,18 +605,19 @@ func FuzzEngineToModel(f *testing.F) {
 // Hits that only exist because an alias was glued to neighbouring bytes
 // ("ORG-8fea"+"CmeBAnk" folds to the keyword acmebank) overlap an alias and
 // are not leaks; LeakCheck still blocks them (fail closed).
+//
+// A hit that only a decoded view sees and whose raw bytes overlap an alias
+// is a decoding artefact (%00000.<alias>: %00 decodes to NUL, leaving a
+// standalone "000" from a preserved label); an encoded original that
+// survived (s3cr3t%40Vault9) overlaps no alias and still counts.
 func survivesFrom(e *Engine, out string) bool {
-	texts := []string{out}
-	for _, v := range decodedViews(out) {
-		texts = append(texts, v.text)
-	}
 	e.s.mu.RLock()
 	var all []string
 	for a := range e.s.aliasExact {
 		all = append(all, lowerASCII(a))
 	}
 	e.s.mu.RUnlock()
-	for _, t := range texts {
+	occurrences := func(t string) []Match {
 		var aliases []Match
 		low := lowerASCII(t)
 		for _, a := range all {
@@ -629,11 +630,33 @@ func survivesFrom(e *Engine, out string) bool {
 				off += i + 1
 			}
 		}
+		return aliases
+	}
+	rawAliases := occurrences(out)
+	straddles := func(aliases []Match, s, end int) bool {
+		for _, a := range aliases {
+			if a.Start < end && s < a.End && (s < a.Start || end > a.End) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, m := range e.s.Dictionary().FindAll(out) {
+		if !straddles(rawAliases, m.Start, m.End) {
+			return true
+		}
+	}
+	for _, v := range decodedViews(out) {
+		viewAliases := occurrences(v.text)
 	hits:
-		for _, m := range e.s.Dictionary().FindAll(t) {
-			for _, a := range aliases {
-				if a.Start < m.End && m.Start < a.End && (m.Start < a.Start || m.End > a.End) {
-					continue hits // straddles an alias boundary
+		for _, m := range e.s.Dictionary().FindAll(v.text) {
+			if straddles(viewAliases, m.Start, m.End) {
+				continue
+			}
+			rs, re := v.rs[m.Start], v.re[m.End-1]
+			for _, a := range rawAliases {
+				if a.Start < re && rs < a.End {
+					continue hits // decoding artefact over an alias
 				}
 			}
 			return true

@@ -49,6 +49,12 @@ const (
 	// boundEmail: like boundHost on the right; on the left no byte that can
 	// belong to a local part (xjo@acme.pt is not jo@acme.pt).
 	boundEmail
+	// boundDigits: no digit on either side (an all-digit value: 1234 is not
+	// inside 12345, but is in -p1234 or pw1234).
+	boundDigits
+	// boundLetters: no letter on either side (an all-letter value: bob is
+	// not inside bobby, but is in bob123).
+	boundLetters
 )
 
 // isAlnumRune reports whether r is a letter or digit (any script).
@@ -69,6 +75,10 @@ func atBoundary(text string, start, end int, mode boundMode) bool {
 		left, right = isHostRune, isHostRune
 	case boundEmail:
 		left, right = isLocalPartRune, isHostRune
+	case boundDigits:
+		left, right = unicode.IsDigit, unicode.IsDigit
+	case boundLetters:
+		left, right = unicode.IsLetter, unicode.IsLetter
 	}
 	if start > 0 {
 		if r, _ := utf8.DecodeLastRuneInString(text[:start]); left(r) {

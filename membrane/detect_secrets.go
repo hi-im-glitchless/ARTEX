@@ -27,6 +27,40 @@ func (secretDetector) Detect(text string) []Span {
 	out = jsonKeySecrets(text, out)
 	out = kvSecrets(text, out)
 	out = userinfoSecrets(text, out)
+	out = append(out, gluedFlagSpans(text)...)
+	return out
+}
+
+// gluedFlagRE: a credential glued to its short option, as the MySQL client
+// family (-ubob -pS3cret) and sshpass (-pS3cret) take it. Group 1 is the
+// option letter, group 2 the value.
+var gluedFlagRE = regexp.MustCompile(`(?:^|[\s"'])-([pu])([^\s"']+)`)
+
+// gluedFlagSpans reports -p<password> and -u<user> on lines that run a
+// command taking credentials that way (not ssh -p2222, psql -p5432: those
+// are ports, and their lines carry no anchor). sshpass only takes -p.
+func gluedFlagSpans(text string) []Span {
+	var out []Span
+	pre := lineHasAny(text, "mysql", "mariadb", "sshpass")
+	for _, m := range lineMatches(gluedFlagRE, text, pre) {
+		k := KindPassword
+		if text[m[2]:m[3]] == "u" {
+			k = KindUsername
+			ls := strings.LastIndexByte(text[:m[0]+1], '\n') + 1
+			le := strings.IndexByte(text[m[0]:], '\n')
+			if le < 0 {
+				le = len(text)
+			} else {
+				le += m[0]
+			}
+			if !strings.Contains(text[ls:le], "mysql") && !strings.Contains(text[ls:le], "mariadb") {
+				continue
+			}
+		}
+		if sp, ok := valueSpan(text, m[4], m[5], k); ok {
+			out = append(out, sp)
+		}
+	}
 	return out
 }
 
@@ -174,19 +208,16 @@ func placeholderValue(v string) bool {
 			return true
 		}
 	}
-	if len(t) >= 2 {
-		pairs := [][2]string{{"<", ">"}, {"{", "}"}, {"${", "}"}, {"[", "]"}, {"%", "%"}, {"$(", ")"}}
-		for _, p := range pairs {
-			if strings.HasPrefix(t, p[0]) && strings.HasSuffix(t, p[1]) {
-				return true
-			}
-		}
-	}
 	if t != "" && strings.Trim(t, t[:1]) == "" && strings.ContainsAny(t[:1], "x*.-_#?") {
 		return true
 	}
-	return false
+	return wrappedPlaceholderRE.MatchString(strings.TrimSpace(v))
 }
+
+// wrappedPlaceholderRE: template markers whose inner text is a name, not a
+// secret (<password>, {{ api_token }}, ${DB_PASS}, %DB_PASSWORD%,
+// [REDACTED], {token}, $(cat file)). {Xk9#mq2} or <Secr3t> are secrets.
+var wrappedPlaceholderRE = regexp.MustCompile(`^(?:<[A-Za-z_ .-]+>|\{\{\s*[\w.]+\s*\}\}|\$\{[A-Za-z_][A-Za-z0-9_.:-]*\}|%[A-Z][A-Z0-9_]*%|\[[A-Z_][A-Z_ ]*\]|\{[a-z_][a-z0-9_.]*\}|\$\([^)]+\))$`)
 
 // Known secret formats (cockpit _SECRET_RES plus common vendor prefixes).
 var (
@@ -486,6 +517,9 @@ func basicAuthSpan(text string, s, e int) (Span, bool) {
 // plainValue reports an unencoded field value; token values may carry an
 // auth scheme ("Bearer x", "Basic b64").
 func plainValue(text string, s, e int, k Kind, out []Span) []Span {
+	if placeholderValue(text[s:e]) {
+		return out // checked whole, before a scheme split ({{ api_token }})
+	}
 	if k == KindToken {
 		return authValue(text, s, e, out)
 	}
@@ -542,12 +576,20 @@ func kvSecrets(text string, out []Span) []Span {
 			continue
 		}
 		raw := text[vs:ve]
+		if placeholderValue(raw) {
+			continue // %DB_PASSWORD% is a template marker, not %DB-escaped
+		}
 		if !strings.ContainsAny(raw, "%+") {
 			out = plainValue(text, vs, ve, k, out)
 			continue
 		}
 		dec, err := url.QueryUnescape(raw)
-		if err != nil || utf8.RuneCountInString(dec) < minLiteralLen || shapedValue(dec) {
+		if err != nil {
+			// Not valid percent-encoding (%Pa55w0rd%): the value is literal.
+			out = plainValue(text, vs, ve, k, out)
+			continue
+		}
+		if utf8.RuneCountInString(dec) < minLiteralLen || shapedValue(dec) || placeholderValue(dec) {
 			continue
 		}
 		out = append(out, Span{Start: vs, End: ve, Kind: k, Value: dec, Encoding: EncURL})
