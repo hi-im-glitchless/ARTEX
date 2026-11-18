@@ -414,14 +414,35 @@ func keyKind(key string) (Kind, bool) {
 		if !ok {
 			continue
 		}
-		for _, f := range comps[i+1:] {
-			if keyQualifiers[f] {
+		for j, f := range comps[i+1:] {
+			if keyQualifiers[f] && !qualifierExempt(key, comps[i], f, j == 0) {
 				return "", false
 			}
 		}
 		return k, true
 	}
 	return "", false
+}
+
+// qualifierExempt: a qualifier that does not turn the credential into a
+// setting. name/id directly after user, login, account or usr is the login
+// itself (user_name, login_id); a dotted key (git's user.name) stays a
+// setting. data after secret or token holds the secret (secret_data), and
+// server/backend after a password names where the password is used
+// (password_server=...).
+func qualifierExempt(key, cred, q string, direct bool) bool {
+	if !direct {
+		return false
+	}
+	switch cred {
+	case "user", "login", "account", "usr":
+		return (q == "name" || q == "id") && !strings.Contains(key, ".")
+	case "secret", "token":
+		return q == "data"
+	case "password", "passwd", "pwd":
+		return q == "server" || q == "backend"
+	}
+	return false
 }
 
 // keyComponents splits a field name at '-', '_', '.', and lower-to-upper
@@ -980,6 +1001,7 @@ var spaceOptNames = map[string]bool{
 	"client-secret": true, "client_secret": true, "access-key": true, "secret-key": true,
 	"auth-token": true, "access-token": true, "db-password": true, "db-user": true,
 	"bearer": true, "oauth2-bearer": true, "passphrase": true, "bearer-token": true,
+	"user-name": true, "login-name": true, "db-pass": true, "root-password": true,
 }
 
 func optionSecrets(text string, out []Span) []Span {
