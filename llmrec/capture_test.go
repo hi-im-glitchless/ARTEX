@@ -101,3 +101,20 @@ func TestCaptureEmptyWhenNoHTTPHappened(t *testing.T) {
 		t.Fatal("unused capture should be empty")
 	}
 }
+
+// The membrane decorator stores its canonical request hash on the capture;
+// the first is kept (the raw request recorded is the first attempt's), and
+// a nil capture (recording off) ignores it.
+func TestCaptureMembraneHash(t *testing.T) {
+	var nilCapt *Capture
+	nilCapt.SetMembraneHash("x")
+	if nilCapt.MembraneHash() != "" {
+		t.Fatal("nil capture returned a hash")
+	}
+	_, c := NewCapture(context.Background())
+	c.SetMembraneHash("first")
+	c.SetMembraneHash("second")
+	if c.MembraneHash() != "first" {
+		t.Fatalf("MembraneHash()=%q", c.MembraneHash())
+	}
+}

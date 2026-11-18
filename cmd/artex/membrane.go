@@ -14,13 +14,18 @@ import (
 	"github.com/Autumn-27/artex/membrane"
 )
 
-const membraneUsage = "usage: artex membrane verify --task <id> [--keys-dir <dir>]"
+const membraneUsage = "usage: artex membrane verify --task <id> [--keys-dir <dir>]\n" +
+	"  exit 0 pass, 1 fail or error, 2 usage, 3 inconclusive (forwarded requests without a recorded wire body)\n" +
+	"  " + membrane.VerifyNote
 
 // runMembrane implements `artex membrane verify --task <id>`: it re-runs the
-// pre-send leak check over the task's recorded wire requests and checks the
-// audit chain, printing `checked=N failed=M chain=ok|broken`. It exits 0
-// only when nothing failed and the chain is intact, 1 on a failure or an
-// error, 2 on a usage error. It reads the database the server uses
+// pre-send leak check over the task's recorded wire requests (paired with
+// the task's audit events by the membrane request hash) and checks the
+// audit chain. It prints `checked=N failed=M chain=ok|broken`, then
+// `result=pass|fail|inconclusive forwarded=F paired=P unpaired=U`. Exit
+// codes: 0 pass, 1 fail (a record failed or the chain is broken) or an
+// error, 2 usage, 3 inconclusive (a forwarded request has no recorded wire
+// body, so it could not be checked). It reads the database the server uses
 // (ARTEX_PG_DSN or config.json) and the server's membrane keys (env, or
 // membrane.keys in the key dir); it never generates keys and never writes
 // the mapping table. Output carries counts, record ids and kinds only.
@@ -78,6 +83,7 @@ func runMembrane(args []string, stdout, stderr io.Writer) int {
 		chain = "broken"
 	}
 	fmt.Fprintf(stdout, "checked=%d failed=%d chain=%s\n", res.Checked, res.Failed, chain)
+	fmt.Fprintf(stdout, "result=%s forwarded=%d paired=%d unpaired=%d\n", res.Result, res.Forwarded, res.Paired, res.Unpaired)
 	if res.NoRaw > 0 || res.Unmembraned > 0 {
 		fmt.Fprintf(stdout, "no_raw=%d unmembraned=%d\n", res.NoRaw, res.Unmembraned)
 	}
@@ -96,8 +102,15 @@ func runMembrane(args []string, stdout, stderr io.Writer) int {
 	if !res.ChainOK {
 		fmt.Fprintf(stdout, "chain_first_bad_id=%d\n", res.ChainFirstBadID)
 	}
-	if !res.OK() {
+	if res.Result != membrane.VerifyPass {
+		fmt.Fprintln(stdout, "note: "+membrane.VerifyNote)
+	}
+	switch res.Result {
+	case membrane.VerifyPass:
+		return 0
+	case membrane.VerifyInconclusive:
+		return 3
+	default:
 		return 1
 	}
-	return 0
 }

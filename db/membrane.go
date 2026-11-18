@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
+	"strconv"
 	"time"
 )
 
@@ -301,11 +303,20 @@ func (d *DB) AppendMembraneEvent(ev *MembraneEvent) error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	if err := appendMembraneEventTx(tx, ev); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// appendMembraneEventTx appends ev inside tx (taking the chain lock for the
+// rest of tx).
+func appendMembraneEventTx(tx *sql.Tx, ev *MembraneEvent) error {
 	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, membraneEventLockKey); err != nil {
 		return err
 	}
 	var prev string
-	err = tx.QueryRow(`SELECT hash FROM membrane_events ORDER BY id DESC LIMIT 1`).Scan(&prev)
+	err := tx.QueryRow(`SELECT hash FROM membrane_events ORDER BY id DESC LIMIT 1`).Scan(&prev)
 	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
@@ -335,7 +346,7 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10::jsonb,$11,$12,$13,$14,$15)`,
 		ev.Enrolled, string(flags), ev.Blocked, ev.BlockReason, ev.RequestSHA256, ev.PrevHash, ev.Hash); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 const membraneEventCols = `id, ts, task_id, session, role, profile, direction, counts, enrolled,
@@ -425,6 +436,14 @@ func (d *DB) PurgeMembraneCompany(companyID int64) (int, error) {
 		return 0, err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	n, err := purgeMembraneCompanyTx(tx, companyID)
+	if err != nil {
+		return 0, err
+	}
+	return n, tx.Commit()
+}
+
+func purgeMembraneCompanyTx(tx *sql.Tx, companyID int64) (int, error) {
 	res, err := tx.Exec(`
 DELETE FROM membrane_entries e
 WHERE e.company_ids = ARRAY[$1]::bigint[]
@@ -441,7 +460,7 @@ WHERE e.company_ids = ARRAY[$1]::bigint[]
 		WHERE $1::bigint = ANY(company_ids)`, companyID); err != nil {
 		return 0, err
 	}
-	return int(n), tx.Commit()
+	return int(n), nil
 }
 
 // taskOfCompany matches a task t linked to company $1: through task_scope
@@ -453,6 +472,18 @@ const taskOfCompany = `(t.company_id=$1 OR EXISTS (SELECT 1 FROM task_scope ts
 // MembraneCompanyReferences counts the live real data that can still reach a
 // prompt for companyID. Purge must be refused while any count is non-zero.
 func (d *DB) MembraneCompanyReferences(companyID int64) (map[string]int, error) {
+	return membraneCompanyReferences(d, companyID)
+}
+
+type rowQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// membraneCompanyReferences counts the references (see
+// MembraneCompanyReferences). "company" is 1 while the company row itself
+// exists: a startup re-seed would otherwise enrol its name and scope again
+// and undo the destroy.
+func membraneCompanyReferences(q rowQuerier, companyID int64) (map[string]int, error) {
 	out := map[string]int{}
 	queries := []struct{ key, q string }{
 		{"tasks", `SELECT count(*) FROM tasks t WHERE t.deleted_at IS NULL AND ` + taskOfCompany},
@@ -461,13 +492,14 @@ func (d *DB) MembraneCompanyReferences(companyID int64) (map[string]int, error) 
 			WHERE t.deleted_at IS NULL AND ` + taskOfCompany},
 		{"lessons", `SELECT count(*) FROM rsi_lessons WHERE company_id=$1`},
 		{"scope", `SELECT count(*) FROM company_scope WHERE company_id=$1`},
+		{"company", `SELECT count(*) FROM companies WHERE id=$1`},
 	}
-	for _, q := range queries {
+	for _, x := range queries {
 		var n int
-		if err := d.QueryRow(q.q, companyID).Scan(&n); err != nil {
-			return nil, fmt.Errorf("membrane references %s: %w", q.key, err)
+		if err := q.QueryRow(x.q, companyID).Scan(&n); err != nil {
+			return nil, fmt.Errorf("membrane references %s: %w", x.key, err)
 		}
-		out[q.key] = n
+		out[x.key] = n
 	}
 	return out, nil
 }
@@ -513,13 +545,91 @@ type MembraneChainHead struct {
 // MembraneChainHeadNow returns the current chain head (zero value when the
 // chain is empty).
 func (d *DB) MembraneChainHeadNow() (MembraneChainHead, error) {
+	// One statement, one snapshot: count, id and hash agree.
 	var h MembraneChainHead
-	if err := d.QueryRow(`SELECT count(*) FROM membrane_events`).Scan(&h.Count); err != nil {
-		return h, err
-	}
-	err := d.QueryRow(`SELECT id, hash FROM membrane_events ORDER BY id DESC LIMIT 1`).Scan(&h.LastID, &h.Hash)
-	if err == sql.ErrNoRows {
-		return h, nil
-	}
+	err := d.QueryRow(`SELECT (SELECT count(*) FROM membrane_events),
+		COALESCE(l.id, 0), COALESCE(l.hash, '')
+		FROM (SELECT 1) one LEFT JOIN LATERAL
+		(SELECT id, hash FROM membrane_events ORDER BY id DESC LIMIT 1) l ON true`).Scan(&h.Count, &h.LastID, &h.Hash)
 	return h, err
+}
+
+// MembraneLastEventAtOrBefore returns the newest event of direction with a
+// timestamp at or before t, or nil.
+func (d *DB) MembraneLastEventAtOrBefore(direction string, t time.Time) (*MembraneEvent, error) {
+	ev, err := scanMembraneEvent(d.QueryRow(`SELECT `+membraneEventCols+` FROM membrane_events
+		WHERE direction=$1 AND ts <= $2 ORDER BY id DESC LIMIT 1`, direction, t.UTC()))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &ev, nil
+}
+
+// MembraneTaskPeriod returns a task's creation and completion times
+// (completed is nil while it is not in a terminal state). Soft-deleted
+// tasks are included; found is false for an unknown or non-numeric id.
+func (d *DB) MembraneTaskPeriod(taskID string) (created time.Time, completed *time.Time, found bool, err error) {
+	id, perr := strconv.ParseInt(taskID, 10, 64)
+	if perr != nil || id <= 0 {
+		return time.Time{}, nil, false, nil
+	}
+	var c sql.NullTime
+	err = d.QueryRow(`SELECT created_at, completed_at FROM tasks WHERE id=$1`, id).Scan(&created, &c)
+	if err == sql.ErrNoRows {
+		return time.Time{}, nil, false, nil
+	}
+	if err != nil {
+		return time.Time{}, nil, false, err
+	}
+	if c.Valid {
+		t := c.Time.UTC()
+		completed = &t
+	}
+	return created.UTC(), completed, true, nil
+}
+
+// membraneDestroyLockKey serialises company key destructions.
+const membraneDestroyLockKey int64 = 7337741097
+
+// ErrMembraneReferenced is returned by DestroyMembraneCompany while real
+// data still references the company.
+var ErrMembraneReferenced = errors.New("membrane: company still referenced")
+
+// DestroyMembraneCompany checks the references, purges the company's
+// entries and appends ev (with its flags completed by flags(n)) in one
+// transaction under an advisory lock: there is no window between the check
+// and the purge, and no purge without its audit event. When any reference
+// count is non-zero it returns the counts and ErrMembraneReferenced, and
+// changes nothing.
+func (d *DB) DestroyMembraneCompany(companyID int64, ev *MembraneEvent, flags func(purged int) []string) (refs map[string]int, purged int, err error) {
+	tx, err := d.Begin()
+	if err != nil {
+		return nil, 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, membraneDestroyLockKey); err != nil {
+		return nil, 0, err
+	}
+	refs, err = membraneCompanyReferences(tx, companyID)
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, n := range refs {
+		if n > 0 {
+			return refs, 0, ErrMembraneReferenced
+		}
+	}
+	if purged, err = purgeMembraneCompanyTx(tx, companyID); err != nil {
+		return refs, 0, err
+	}
+	if flags != nil {
+		ev.Flags = flags(purged)
+	}
+	if err := appendMembraneEventTx(tx, ev); err != nil {
+		return refs, 0, fmt.Errorf("membrane destroy: audit event: %w", err)
+	}
+	return refs, purged, tx.Commit()
 }

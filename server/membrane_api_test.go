@@ -86,7 +86,9 @@ func utf16Slice(s string, start, end int) string {
 func TestPreviewDoesNotEnroll(t *testing.T) {
 	f := newSeedFixture(t)
 	st := f.s.membraneStore()
-	text := "Préview: log in to portal.acmebank.pt as joao.silva / hunter2 for Acme Bank, " +
+	// "Préview 😀: log in to " is 22 UTF-16 code units (é is one unit, the
+	// emoji a surrogate pair) but 25 bytes.
+	text := "Préview 😀: log in to portal.acmebank.pt as joao.silva / hunter2 for Acme Bank, " +
 		"host 185.12.40.7, contact Maria Fernandes at maria@acmebank.pt."
 	beforeLen, beforeRows := st.Len(), countMembraneEntries(t, f.m)
 	var beforeBlocks int
@@ -146,6 +148,15 @@ func TestPreviewDoesNotEnroll(t *testing.T) {
 	if real != got.Aliased {
 		t.Fatalf("preview differs from the real run:\n preview %q\n real    %q", got.Aliased, real)
 	}
+	// Exact UTF-16 offsets of the host alias.
+	host, _, ok := f.s.membraneStore().AliasFor("portal.acmebank.pt")
+	if !ok || !strings.HasPrefix(got.Aliased[25:], host) {
+		t.Fatalf("host alias not at byte 25 of %q", got.Aliased)
+	}
+	hostLen := len(utf16.Encode([]rune(host)))
+	if got.Spans[0].Start != 22 || got.Spans[0].End != 22+hostLen || got.Spans[0].Kind != "domain" {
+		t.Fatalf("first span = %+v, want {22 %d domain}", got.Spans[0], 22+hostLen)
+	}
 }
 
 func TestDestroyRefusedWhileReferenced(t *testing.T) {
@@ -164,7 +175,7 @@ func TestDestroyRefusedWhileReferenced(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.References["tasks"] < 1 || body.References["scope"] < 1 {
+	if body.References["tasks"] < 1 || body.References["scope"] < 1 || body.References["company"] != 1 {
 		t.Fatalf("references = %v", body.References)
 	}
 	if countMembraneEntries(t, f.m) != before {
@@ -198,6 +209,15 @@ func TestDestroyPurges(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.Enroll(membrane.KindOrg, "DestroyCoKeyword", prov); err != nil {
+		t.Fatal(err)
+	}
+	// The company row itself is a reference (a re-seed would undo the
+	// destroy): refused until it is deleted.
+	if w := membraneAPICall(t, s, "POST", fmt.Sprintf("/api/companies/%d/membrane/destroy", cid), nil); w.Code != http.StatusConflict ||
+		!strings.Contains(w.Body.String(), `"company":1`) {
+		t.Fatalf("destroy with the company row present: %d %s", w.Code, w.Body)
+	}
+	if err := cs.DeleteCompany(cid); err != nil {
 		t.Fatal(err)
 	}
 	head0, err := m.pg.MembraneChainHeadNow()
@@ -264,8 +284,9 @@ func TestMembraneAPIEventsVerifyEvidence(t *testing.T) {
 	raw := func(s string) string { b, _ := json.Marshal(map[string]any{"messages": []string{s}}); return string(b) }
 	var ids []int64
 	for _, r := range []db.LLMRecord{
-		{TaskID: f.id(), ProfileName: profile, Model: "m", RequestBody: "operator view acmebank.pt", RawRequest: raw(clean)},
-		{TaskID: f.id(), ProfileName: profile, Model: "m", RawRequest: raw("leaked hunter2 here")},
+		{TaskID: f.id(), ProfileName: profile, Model: "m", RequestBody: "operator view acmebank.pt", RawRequest: raw(clean),
+			MembraneRequestSHA256: strings.Repeat("a", 64)},
+		{TaskID: f.id(), ProfileName: "", Model: "m", RawRequest: raw("leaked hunter2 here"), MembraneRequestSHA256: strings.Repeat("b", 64)},
 		{TaskID: f.id(), ProfileName: "local-trusted", Model: "m", RawRequest: raw("local model sees acmebank.pt")},
 	} {
 		if err := f.m.pg.InsertLLMRecord(&r); err != nil {
@@ -297,7 +318,8 @@ func TestMembraneAPIEventsVerifyEvidence(t *testing.T) {
 	}
 	var vr membrane.VerifyResult
 	_ = json.Unmarshal(w.Body.Bytes(), &vr)
-	if vr.Checked != 2 || vr.Failed != 1 || !slices.Equal(vr.FailedIDs, []int64{ids[1]}) || vr.Unmembraned != 1 || !vr.ChainOK {
+	if vr.Result != membrane.VerifyFail || vr.Checked != 2 || vr.Failed != 1 || !slices.Equal(vr.FailedIDs, []int64{ids[1]}) ||
+		vr.Unmembraned != 1 || vr.Forwarded != 2 || vr.Paired != 2 || !vr.ChainOK {
 		t.Fatalf("verify = %+v (ids %v)", vr, ids)
 	}
 	if strings.Contains(w.Body.String(), "hunter2") || strings.Contains(w.Body.String(), "acmebank") {
@@ -324,5 +346,27 @@ func TestMembraneAPIEventsVerifyEvidence(t *testing.T) {
 	}
 	if w.Header().Get("Content-Type") != "application/json" {
 		t.Fatalf("json evidence content type %q", w.Header().Get("Content-Type"))
+	}
+}
+
+// Every boot appends a "start" event saying whether the override is on.
+func TestMembraneAPIStartEventEveryBoot(t *testing.T) {
+	membraneTestKeys(t)
+	last := func(m *Manager) []string {
+		ev, err := m.pg.MembraneLastEventAtOrBefore(membrane.DirectionStart, time.Now().Add(time.Hour))
+		if err != nil || ev == nil {
+			t.Fatalf("no start event: %v", err)
+		}
+		return ev.Flags
+	}
+	t.Setenv("ARTEX_MEMBRANE", "")
+	_, m := newMembraneTestServer(t)
+	if f := last(m); !slices.Equal(f, []string{membrane.StartFlagMembraned}) {
+		t.Fatalf("membraned boot flags = %v", f)
+	}
+	t.Setenv("ARTEX_MEMBRANE", "off")
+	_, m = newMembraneTestServer(t)
+	if f := last(m); !slices.Equal(f, []string{membrane.StartFlagOverride}) {
+		t.Fatalf("override boot flags = %v", f)
 	}
 }

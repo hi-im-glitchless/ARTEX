@@ -151,6 +151,11 @@ type LLMRecord struct {
 	// records written before this was added, or when the call never reached HTTP.
 	RawRequest  string `json:"raw_request,omitempty"`
 	RawResponse string `json:"raw_response,omitempty"`
+	// MembraneRequestSHA256 is the identity membrane's canonical request hash
+	// for this call (the request_sha256 of its "request" audit event); empty
+	// when the call did not go through the membrane. It pairs the recorded
+	// wire bytes with the audit event for offline verification.
+	MembraneRequestSHA256 string `json:"membrane_request_sha256,omitempty"`
 }
 
 const llmRecordsSchema = `
@@ -185,6 +190,7 @@ ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS worker TEXT;
 ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS profile_name TEXT;
 ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS raw_request TEXT;
 ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS raw_response TEXT;
+ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS membrane_request_sha256 TEXT;
 `
 
 // EnsureLLMRecordsTable creates the llm_records table if it does not exist.
@@ -209,12 +215,12 @@ func (d *DB) EnsureLLMRecordsTable() error {
 // InsertLLMRecord stores one LLM call record.
 func (d *DB) InsertLLMRecord(r *LLMRecord) error {
 	_, err := d.Exec(`
-INSERT INTO llm_records(model, profile_name, session_id, task_id, worker, latency_ms, input_tokens, output_tokens, cache_read, cache_write, status, error, request_body, response_body, raw_request, raw_response)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+INSERT INTO llm_records(model, profile_name, session_id, task_id, worker, latency_ms, input_tokens, output_tokens, cache_read, cache_write, status, error, request_body, response_body, raw_request, raw_response, membrane_request_sha256)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
 		r.Model, nullIfEmpty(r.ProfileName), r.SessionID, nullIfEmpty(r.TaskID), nullIfEmpty(r.Worker),
 		r.LatencyMs, r.InputTokens, r.OutputTokens, r.CacheRead, r.CacheWrite,
 		r.Status, nullIfEmpty(r.Error), nullIfEmpty(r.RequestBody), nullIfEmpty(r.ResponseBody),
-		nullIfEmpty(r.RawRequest), nullIfEmpty(r.RawResponse))
+		nullIfEmpty(r.RawRequest), nullIfEmpty(r.RawResponse), nullIfEmpty(r.MembraneRequestSHA256))
 	return err
 }
 
@@ -352,6 +358,9 @@ type LLMRawRequest struct {
 	ID      int64
 	Profile string
 	Raw     string
+	// MembraneHash is the record's membrane_request_sha256 (empty when the
+	// call did not go through the membrane).
+	MembraneHash string
 }
 
 // LLMRawRequests pages the records of one exact task_id in id order (keyset:
@@ -360,7 +369,7 @@ func (d *DB) LLMRawRequests(taskID string, afterID int64, limit int) ([]LLMRawRe
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := d.Query(`SELECT id, COALESCE(profile_name,''), COALESCE(raw_request,'') FROM llm_records
+	rows, err := d.Query(`SELECT id, COALESCE(profile_name,''), COALESCE(raw_request,''), COALESCE(membrane_request_sha256,'') FROM llm_records
 		WHERE COALESCE(task_id,'') = $1 AND id > $2 ORDER BY id LIMIT $3`, taskID, afterID, limit)
 	if err != nil {
 		return nil, err
@@ -369,7 +378,7 @@ func (d *DB) LLMRawRequests(taskID string, afterID int64, limit int) ([]LLMRawRe
 	var out []LLMRawRequest
 	for rows.Next() {
 		var r LLMRawRequest
-		if err := rows.Scan(&r.ID, &r.Profile, &r.Raw); err != nil {
+		if err := rows.Scan(&r.ID, &r.Profile, &r.Raw, &r.MembraneHash); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

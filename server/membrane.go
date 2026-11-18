@@ -51,6 +51,20 @@ func (s *Server) initMembrane(keyDir string) {
 	if s.m.pg != nil {
 		st.audit = membrane.NewDBAuditor(s.m.pg)
 	}
+	// Every boot appends a "start" event saying whether the override is in
+	// force for this run (evidence bounds each run by the next start). A
+	// membrane that then fails to initialise fails closed, so "override:false"
+	// holds for it too.
+	if st.audit != nil {
+		flag := membrane.StartFlagMembraned
+		if agent.MembraneOverride() {
+			flag = membrane.StartFlagOverride
+		}
+		ev := membrane.Event{Direction: membrane.DirectionStart, Report: membrane.Report{Flags: []string{flag}}}
+		if err := st.audit.Record(context.Background(), ev); err != nil {
+			log.Printf("[membrane] start audit event failed: %v", err)
+		}
+	}
 	if agent.MembraneOverride() {
 		st.override = true
 		log.Printf("[membrane] WARNING: %s=off — the identity membrane is DISABLED; remote LLM providers receive real data", agent.MembraneEnv)

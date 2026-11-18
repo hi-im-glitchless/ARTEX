@@ -1,8 +1,8 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -305,10 +305,11 @@ func (s *Server) membraneTaskEvidence(w http.ResponseWriter, r *http.Request) {
 
 // membraneDestroyCompany purges the mapping entries referenced only by the
 // company (spec §10.5). It is refused (409, with the reference counts) while
-// any real data that can still reach a prompt references the company. The
-// purge is recorded as a "destroy" audit event (company id and count only)
-// and the live store reloads, so the purged originals leave memory too.
-// The company row itself may already be deleted.
+// any real data that can still reach a prompt references the company,
+// including the company row itself (a re-seed would undo the destroy). The
+// reference check, the purge and the "destroy" audit event (company id and
+// count only) run in one database transaction; then the live store
+// reloads, so the purged originals leave memory too.
 func (s *Server) membraneDestroyCompany(w http.ResponseWriter, r *http.Request) {
 	if s.m == nil || s.m.pg == nil {
 		writeErr(w, http.StatusServiceUnavailable, "database unavailable")
@@ -319,46 +320,30 @@ func (s *Server) membraneDestroyCompany(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, "invalid id")
 		return
 	}
-	refs, err := s.m.pg.MembraneCompanyReferences(cid)
+	ev := &db.MembraneEvent{Direction: "destroy"}
+	refs, n, err := s.m.pg.DestroyMembraneCompany(cid, ev, func(purged int) []string {
+		return []string{"company:" + strconv.FormatInt(cid, 10), "purged:" + strconv.Itoa(purged)}
+	})
+	if errors.Is(err, db.ErrMembraneReferenced) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":      "company data still references the membrane mapping; delete the company and its data first",
+			"references": refs,
+		})
+		return
+	}
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "reference check failed")
+		writeErr(w, http.StatusInternalServerError, "destroy failed (nothing purged)")
 		log.Printf("[membrane] destroy company %d: %v", cid, err)
 		return
 	}
-	for _, n := range refs {
-		if n > 0 {
-			writeJSON(w, http.StatusConflict, map[string]any{
-				"error":      "company data still references the membrane mapping; remove it first",
-				"references": refs,
-			})
-			return
-		}
-	}
-	n, err := s.m.pg.PurgeMembraneCompany(cid)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "purge failed")
-		log.Printf("[membrane] destroy company %d: purge: %v", cid, err)
-		return
-	}
-	var problems []string
 	if st := s.membraneStore(); st != nil {
 		if err := st.Reload(); err != nil {
-			problems = append(problems, "store reload failed")
 			log.Printf("[membrane] destroy company %d: reload: %v", cid, err)
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error":      "purged " + strconv.Itoa(n) + " entries (audited), but the in-memory store did not reload; restart the server",
+				"company_id": cid, "purged": n})
+			return
 		}
-	}
-	ev := membrane.Event{Direction: "destroy", Report: membrane.Report{
-		Flags: []string{"company:" + strconv.FormatInt(cid, 10), "purged:" + strconv.Itoa(n)}}}
-	if a := s.membraneAuditor(); a == nil {
-		problems = append(problems, "no auditor")
-	} else if err := a.Record(context.Background(), ev); err != nil {
-		problems = append(problems, "audit event failed")
-		log.Printf("[membrane] destroy company %d: audit: %v", cid, err)
-	}
-	if len(problems) > 0 {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": "purged " + strconv.Itoa(n) + " entries, but: " + strings.Join(problems, ", "), "company_id": cid, "purged": n})
-		return
 	}
 	writeJSON(w, 200, map[string]any{"company_id": cid, "purged": n})
 }

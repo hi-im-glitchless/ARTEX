@@ -264,6 +264,10 @@ func (w *wrapped) prepare(ctx context.Context, req llm.CompletionRequest) (llm.C
 	if err := w.a.Record(ctx, ev); err != nil {
 		return llm.CompletionRequest{}, m, fmt.Errorf("membrane: audit failed, request not sent: %w", err)
 	}
+	// When recording is on, the recorder's capture pairs the recorded wire
+	// bytes with this event, so `membrane verify` can prove every forwarded
+	// request (raw-bytes proof level).
+	llmrec.CaptureFrom(ctx).SetMembraneHash(ev.RequestSHA256)
 	return out, m, nil
 }
 

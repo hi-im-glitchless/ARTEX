@@ -15,35 +15,80 @@ type VerifyRecord struct {
 	Raw string
 }
 
+// Verify outcomes (VerifyResult.Result).
+const (
+	VerifyPass         = "pass"
+	VerifyFail         = "fail"
+	VerifyInconclusive = "inconclusive"
+)
+
+// VerifyNote states what a verification does and does not show; the CLI,
+// the API and the evidence repeat it.
+const VerifyNote = "Verification re-scans the recorded wire bytes with the membrane dictionary as of the check. " +
+	"A failure may be a value the membrane learned after the request was sent: still a disclosure to the model provider, " +
+	"but not necessarily a membrane miss at send time. Values purged by a company key destruction are no longer scanned."
+
 // VerifyResult is the outcome of an offline verification (spec §10.2). It
 // carries counts, record ids and kinds only, never values.
 //
-// Checked counts the records with raw bytes that were scanned, Failed those
-// in which LeakCheck found an enrolled original (FailedIDs, ascending;
-// FailedKinds sums the hits per kind). NoRaw counts the records without raw
-// bytes (recording was off or the call never reached HTTP), Unmembraned the
-// task records of profiles that were never membraned (trusted local models,
-// which legitimately see originals). ChainOK and ChainFirstBadID come from
-// the audit chain check, which Verify itself does not run (VerifyTask does).
+// Records are paired with the task's "request" audit events by the
+// membrane's canonical request hash (llm_records.membrane_request_sha256 =
+// the event's request_sha256). A record without that hash did not go
+// through the membrane (a trusted local model, or a record written before
+// pairing existed) and is counted in Unmembraned, not scanned.
+//
+// Checked counts the membraned records with raw bytes that were scanned,
+// Failed those in which LeakCheck found an enrolled original (FailedIDs,
+// ascending; FailedKinds sums the hits per kind), NoRaw membraned records
+// without raw bytes. Forwarded counts the task's forwarded request events,
+// Paired those with a scanned record, Unpaired the rest. Result is "fail"
+// when a record failed or the chain is broken, else "inconclusive" when a
+// forwarded request has no scanned record (recording off, or records
+// missing), else "pass". ChainOK and ChainFirstBadID come from the audit
+// chain check, which Verify itself does not run (VerifyTask does).
 type VerifyResult struct {
+	Result          string         `json:"result"`
 	Checked         int            `json:"checked"`
 	Failed          int            `json:"failed"`
 	FailedIDs       []int64        `json:"failed_ids"`
 	FailedKinds     map[string]int `json:"failed_kinds"`
 	NoRaw           int            `json:"no_raw"`
 	Unmembraned     int            `json:"unmembraned"`
+	Forwarded       int            `json:"forwarded"`
+	Paired          int            `json:"paired"`
+	Unpaired        int            `json:"unpaired"`
 	ChainOK         bool           `json:"chain_ok"`
 	ChainFirstBadID int64          `json:"chain_first_bad_id,omitempty"`
+	Note            string         `json:"note"`
 }
 
-// OK reports whether nothing failed and the chain is intact.
-func (r VerifyResult) OK() bool { return r.Failed == 0 && r.ChainOK }
+// OK reports whether the verification passed: nothing failed, the chain is
+// intact and every forwarded request was checked.
+func (r VerifyResult) OK() bool { return r.Result == VerifyPass }
+
+// finish sets Result from the counts.
+func (r *VerifyResult) finish() {
+	switch {
+	case r.Failed > 0 || !r.ChainOK:
+		r.Result = VerifyFail
+	case r.Unpaired > 0 || (r.Forwarded > 0 && r.Checked == 0):
+		r.Result = VerifyInconclusive
+	default:
+		r.Result = VerifyPass
+	}
+	r.Note = VerifyNote
+}
+
+func newVerifyResult() VerifyResult {
+	return VerifyResult{FailedIDs: []int64{}, FailedKinds: map[string]int{}, Note: VerifyNote}
+}
 
 // Verify re-runs the pre-send leak check over the recorded raw requests with
 // the current dictionary: an original enrolled after a request was sent is
-// caught too. Records with no raw bytes are counted in NoRaw.
+// caught too. Records with no raw bytes are counted in NoRaw. It does not
+// pair records with events nor check the chain (Result stays empty).
 func Verify(e *Engine, records []VerifyRecord) VerifyResult {
-	r := VerifyResult{FailedIDs: []int64{}, FailedKinds: map[string]int{}}
+	r := newVerifyResult()
 	r.add(e, records)
 	return r
 }
@@ -78,9 +123,9 @@ type VerifySource interface {
 // verifyPage bounds the raw requests held in memory at once.
 const verifyPage = 50
 
-// VerifyTask verifies every recorded request of taskID made through a
-// membraned profile (one that appears in the task's "request" audit
-// events) and checks the whole audit chain. Errors carry no values.
+// VerifyTask verifies every recorded membraned request of taskID, pairs
+// them with the task's forwarded request events and checks the whole audit
+// chain. Errors carry no values.
 func VerifyTask(e *Engine, src VerifySource, taskID string) (VerifyResult, error) {
 	evs, err := src.MembraneTaskEvents(taskID)
 	if err != nil {
@@ -90,13 +135,16 @@ func VerifyTask(e *Engine, src VerifySource, taskID string) (VerifyResult, error
 }
 
 func verifyTask(e *Engine, src VerifySource, taskID string, evs []db.MembraneEvent) (VerifyResult, error) {
-	membraned := map[string]bool{}
+	res := newVerifyResult()
+	// Forwarded request events by hash (identical requests share a hash:
+	// pairing is by multiplicity).
+	want := map[string]int{}
 	for _, ev := range evs {
-		if ev.Direction == "request" && ev.Profile != "" {
-			membraned[ev.Profile] = true
+		if ev.Direction == "request" && !ev.Blocked {
+			res.Forwarded++
+			want[ev.RequestSHA256]++
 		}
 	}
-	res := VerifyResult{FailedIDs: []int64{}, FailedKinds: map[string]int{}}
 	var after int64
 	for {
 		page, err := src.LLMRawRequests(taskID, after, verifyPage)
@@ -109,18 +157,24 @@ func verifyTask(e *Engine, src VerifySource, taskID string, evs []db.MembraneEve
 		recs := make([]VerifyRecord, 0, len(page))
 		for _, p := range page {
 			after = p.ID
-			if !membraned[p.Profile] {
+			if p.MembraneHash == "" {
 				res.Unmembraned++
 				continue
+			}
+			if p.Raw != "" && want[p.MembraneHash] > 0 {
+				want[p.MembraneHash]--
+				res.Paired++
 			}
 			recs = append(recs, VerifyRecord{ID: p.ID, Raw: p.Raw})
 		}
 		res.add(e, recs)
 	}
+	res.Unpaired = res.Forwarded - res.Paired
 	ok, bad, err := src.VerifyMembraneChain()
 	if err != nil {
 		return VerifyResult{}, fmt.Errorf("membrane verify: audit chain: %w", err)
 	}
 	res.ChainOK, res.ChainFirstBadID = ok, bad
+	res.finish()
 	return res, nil
 }

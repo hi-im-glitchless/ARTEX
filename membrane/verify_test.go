@@ -74,9 +74,10 @@ func evidenceFixture() EvidenceInput {
 			ev(5, "request", true, "seed sync failed", nil, nil, "Acme Bank profile"),
 			ev(6, "request", false, "", []string{"suspicious_domain"}, map[string]int{"ipv4": 2}, "kimi"),
 		},
-		Overrides: []db.MembraneEvent{{ID: 9, TS: t0.Add(3 * time.Minute), Direction: "override"}},
-		Verify:    VerifyResult{Checked: 1, NoRaw: 1, ChainOK: true},
-		ChainHead: db.MembraneChainHead{LastID: 77, Hash: strings.Repeat("c", 64), Count: 77},
+		Boots:               []db.MembraneEvent{{ID: 9, TS: t0.Add(3 * time.Minute), Direction: DirectionStart, Flags: []string{StartFlagOverride}}},
+		BootHistoryComplete: true,
+		Verify:              VerifyResult{Result: VerifyInconclusive, Checked: 1, NoRaw: 1, Forwarded: 2, Paired: 1, Unpaired: 1, ChainOK: true},
+		ChainHead:           db.MembraneChainHead{LastID: 77, Hash: strings.Repeat("c", 64), Count: 77},
 	}
 }
 
@@ -117,8 +118,12 @@ func TestEvidenceContent(t *testing.T) {
 		"request-hash",
 		strings.Repeat("c", 64),            // chain head hash
 		"base64/hex blobs, signed cookies", // §7.2 limits text
-		"override",
+		"OVERRIDDEN",
 		"leak_check",
+		"INCONCLUSIVE",
+		"Model-view excerpts are omitted by design",
+		"dictionary as of the check",
+		"still has hash = earlier head.hash",
 	} {
 		if !strings.Contains(md, want) {
 			t.Errorf("markdown lacks %q", want)
@@ -141,8 +146,8 @@ func TestEvidenceContent(t *testing.T) {
 	if doc.Flags["suspicious_name"] != 1 || doc.Flags["unresolved"] != 1 || doc.Flags["other"] != 1 {
 		t.Fatalf("flags = %v", doc.Flags)
 	}
-	if doc.Proof.Level != "request-hash" || doc.Chain.Head.LastID != 77 || len(doc.Overrides) != 1 {
-		t.Fatalf("proof %+v chain %+v overrides %v", doc.Proof, doc.Chain, doc.Overrides)
+	if doc.Proof.Level != "request-hash" || doc.Chain.Head.LastID != 77 || !doc.Override.InForce || len(doc.Override.Boots) != 1 {
+		t.Fatalf("proof %+v chain %+v override %+v", doc.Proof, doc.Chain, doc.Override)
 	}
 	if !slices.Contains(doc.Profiles, "kimi") || len(doc.Profiles) != 2 {
 		t.Fatalf("profiles = %v", doc.Profiles)
@@ -152,14 +157,13 @@ func TestEvidenceContent(t *testing.T) {
 	}
 
 	// Every forwarded request has a raw record: raw-bytes proof.
-	in.Verify.Checked = 2
-	in.Verify.NoRaw = 0
+	in.Verify = VerifyResult{Result: VerifyPass, Checked: 2, Forwarded: 2, Paired: 2, ChainOK: true}
 	_, js = BuildEvidence(in)
 	_ = json.Unmarshal(js, &doc)
 	if doc.Proof.Level != "raw-bytes" {
 		t.Fatalf("proof level = %q, want raw-bytes", doc.Proof.Level)
 	}
-	in.Verify.Checked = 1
+	in.Verify = VerifyResult{Result: VerifyInconclusive, Checked: 2, Forwarded: 2, Paired: 1, Unpaired: 1, ChainOK: true}
 	_, js = BuildEvidence(in)
 	_ = json.Unmarshal(js, &doc)
 	if doc.Proof.Level != "request-hash" {
