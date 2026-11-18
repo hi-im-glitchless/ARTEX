@@ -295,6 +295,11 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !required {
+		// The membrane is skipped only because the endpoint is local; a 307/308
+		// would resend the real body to wherever it points.
+		client.CheckRedirect = refuseUntrustedRedirect
+	}
 	lc := llm.Config{
 		Format:     c.Format,
 		BaseURL:    c.BaseURL,

@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"log"
+	"path/filepath"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/membrane"
@@ -60,17 +62,39 @@ func (s *Server) initMembrane(keyDir string) {
 		log.Printf("[membrane] not initialised (no database) — remote LLM providers will fail closed")
 		return
 	}
+	fail := func(reason string) {
+		st.err = reason
+		log.Printf("[membrane] not initialised — remote LLM providers will fail closed: %s", reason)
+	}
+	// Generating fresh keys over rows encrypted with other keys would leave
+	// the membrane permanently unable to open (for example a Docker container
+	// recreated without its key file). Refuse, and say what to restore.
+	if !membrane.KeysConfigured(keyDir) {
+		var has bool
+		if err := s.m.pg.QueryRow(`SELECT EXISTS(SELECT 1 FROM membrane_entries)`).Scan(&has); err != nil {
+			fail("cannot check the mapping table: " + err.Error())
+			return
+		}
+		if has {
+			fail("membrane keys missing but the mapping table has entries encrypted with other keys — restore " +
+				membrane.EnvEncKey + "/" + membrane.EnvHMACKey + " or " + filepath.Join(keyDir, membrane.KeysFileName))
+			return
+		}
+	}
 	encKey, hmacKey, src, err := membrane.LoadKeysSource(keyDir)
 	if err != nil {
-		st.err = "keys: " + err.Error()
-		log.Printf("[membrane] not initialised — remote LLM providers will fail closed: %s", st.err)
+		fail("keys: " + err.Error())
 		return
 	}
 	st.keysSource = src
 	store, err := membrane.OpenStore(s.m.pg, encKey, hmacKey)
+	if errors.Is(err, membrane.ErrKeyMismatch) {
+		fail("membrane keys do not match the stored mapping — restore the keys the table was written with (" +
+			membrane.EnvEncKey + "/" + membrane.EnvHMACKey + " or " + membrane.KeysFileName + "): " + err.Error())
+		return
+	}
 	if err != nil {
-		st.err = "store: " + err.Error()
-		log.Printf("[membrane] not initialised — remote LLM providers will fail closed: %s", st.err)
+		fail("store: " + err.Error())
 		return
 	}
 	st.store = store

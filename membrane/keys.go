@@ -42,6 +42,18 @@ func LoadKeys(dataDir string) (encKey, hmacKey []byte, err error) {
 	return encKey, hmacKey, err
 }
 
+// KeysConfigured reports whether keys exist without generating any: either
+// env var is set, or <dataDir>/membrane.keys exists (or cannot be checked,
+// in which case LoadKeysSource reports the problem). Callers use it to refuse
+// generating fresh keys over a mapping table written with other keys.
+func KeysConfigured(dataDir string) bool {
+	if strings.TrimSpace(os.Getenv(EnvEncKey)) != "" || strings.TrimSpace(os.Getenv(EnvHMACKey)) != "" {
+		return true
+	}
+	_, err := os.Stat(filepath.Join(dataDir, KeysFileName))
+	return !errors.Is(err, fs.ErrNotExist)
+}
+
 // LoadKeysSource is LoadKeys that also reports where the keys came from.
 // Setting only one of the two env vars is an error, as is a key file
 // readable by group or others.

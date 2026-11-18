@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,12 +16,62 @@ import (
 	"github.com/Autumn-27/artex/membrane"
 )
 
-// membraneTestKeys pins the membrane keys for the server test database, so
-// every test (and every run) opens the same encrypted table.
+// membraneTestKeys re-pins the TestMain membrane keys for a test that may
+// run after another one changed them.
 func membraneTestKeys(t *testing.T) {
 	t.Helper()
-	t.Setenv(membrane.EnvEncKey, base64.StdEncoding.EncodeToString([]byte(strings.Repeat("e", 32))))
-	t.Setenv(membrane.EnvHMACKey, base64.StdEncoding.EncodeToString([]byte(strings.Repeat("h", 32))))
+	t.Setenv(membrane.EnvEncKey, testMembraneEncKey)
+	t.Setenv(membrane.EnvHMACKey, testMembraneHMACKey)
+}
+
+// Keys are never generated over a non-empty mapping table, and a key
+// mismatch is reported as such: both fail closed with a clear status.
+func TestMembraneMissingOrWrongKeysWithEntries(t *testing.T) {
+	t.Setenv("ARTEX_MEMBRANE", "")
+	membraneTestKeys(t)
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { m.Close() })
+	if m.pg == nil {
+		t.Skip("no postgres for this run")
+	}
+	enc, mac, _, err := membrane.LoadKeysSource(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := membrane.OpenStore(m.pg, enc, mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Enroll(membrane.KindDomain, "t-membrane-keys.com", membrane.Provenance{Source: "seed"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// No env keys and no key file: refuse to generate.
+	t.Setenv(membrane.EnvEncKey, "")
+	t.Setenv(membrane.EnvHMACKey, "")
+	keyDir := t.TempDir()
+	s := &Server{m: m}
+	s.initMembrane(keyDir)
+	got := s.membraneStatus()
+	if got.Enabled || !strings.Contains(got.Error, "membrane keys missing") || strings.Contains(got.Error, "t-membrane-keys") {
+		t.Fatalf("missing keys: %+v", got)
+	}
+	if _, err := os.Stat(filepath.Join(keyDir, membrane.KeysFileName)); !os.IsNotExist(err) {
+		t.Fatalf("a key file was generated over existing entries: %v", err)
+	}
+
+	// Other keys: reported as a mismatch.
+	t.Setenv(membrane.EnvEncKey, base64.StdEncoding.EncodeToString([]byte(strings.Repeat("x", 32))))
+	t.Setenv(membrane.EnvHMACKey, base64.StdEncoding.EncodeToString([]byte(strings.Repeat("y", 32))))
+	s = &Server{m: m}
+	s.initMembrane(t.TempDir())
+	got = s.membraneStatus()
+	if got.Enabled || !strings.Contains(got.Error, "keys do not match the stored mapping") {
+		t.Fatalf("wrong keys: %+v", got)
+	}
 }
 
 func newMembraneTestServer(t *testing.T) (*Server, *Manager) {

@@ -390,6 +390,9 @@ returns an error, so no requests are possible. Status is shown in the UI.
   key file under the data dir. If absent on first start, they are generated and
   stored 0600. Losing the keys makes existing aliases unrecoverable; this is
   documented.
+  The key file lives in ARTEX's key dir (next to `jwt.key`, outside the browsable
+  workspace); Docker deployments must set both env vars (the container's key dir is
+  not a volume), and keys are never generated while `membrane_entries` has rows.
 - In-memory index: originals→alias and alias→original maps plus an Aho-Corasick
   automaton, rebuilt incrementally on enrolment, guarded for concurrent agents.
 

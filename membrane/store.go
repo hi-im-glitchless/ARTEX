@@ -133,6 +133,11 @@ type Store struct {
 // generation returns the store's change counter.
 func (s *Store) generation() uint64 { return s.gen.Load() }
 
+// ErrKeyMismatch is wrapped by OpenStore errors when a stored row does not
+// decrypt or its index HMAC does not match: the keys are not the ones the
+// mapping table was written with.
+var ErrKeyMismatch = errors.New("membrane keys do not match the stored mapping")
+
 // OpenStore loads and decrypts every entry. encKey must be 32 bytes
 // (AES-256) and hmacKey 32 bytes. A row that does not decrypt, or whose
 // original does not match its index HMAC, is an error (wrong keys).
@@ -239,14 +244,14 @@ func (s *Store) reload() error {
 	for _, r := range rows {
 		orig, err := s.decrypt(r.Kind, r.OriginalHMAC, r.OriginalEnc)
 		if err != nil {
-			return fmt.Errorf("membrane store: decrypt entry %d: %w (wrong ARTEX_MEMBRANE_KEY?)", r.ID, err)
+			return fmt.Errorf("membrane store: decrypt entry %d: %v: %w (wrong ARTEX_MEMBRANE_KEY?)", r.ID, err, ErrKeyMismatch)
 		}
 		norm, _, err := normalise(Kind(r.Kind), orig)
 		if err != nil {
 			return fmt.Errorf("membrane store: entry %d: stored %s original does not normalise", r.ID, r.Kind)
 		}
 		if !hmac.Equal([]byte(s.indexHMAC(Kind(r.Kind), norm)), []byte(r.OriginalHMAC)) {
-			return fmt.Errorf("membrane store: entry %d: index HMAC mismatch (wrong ARTEX_MEMBRANE_HMAC_KEY?)", r.ID)
+			return fmt.Errorf("membrane store: entry %d: index HMAC mismatch: %w (wrong ARTEX_MEMBRANE_HMAC_KEY?)", r.ID, ErrKeyMismatch)
 		}
 		fresh.indexEntry(&entry{id: r.ID, kind: Kind(r.Kind), norm: norm, original: orig, alias: r.Alias,
 			retired: r.RetiredAliases, companyIDs: r.CompanyIDs, taskIDs: r.TaskIDs})

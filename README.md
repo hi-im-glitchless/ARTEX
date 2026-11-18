@@ -249,6 +249,8 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 **LLM**: `export ANTHROPIC_API_KEY=sk-...` (or `OPENAI_API_KEY`); you can also fill it in on the UI's "LLM Configuration" page.
 Optional: `ARTEX_LLM_PROVIDER` / `ARTEX_LLM_MODEL` / `ARTEX_LLM_BASE_URL` / `ARTEX_LLM_PROXY`.
 
+**Identity membrane keys**: requests to remote LLM providers are rewritten into aliases using two keys, `ARTEX_MEMBRANE_KEY` and `ARTEX_MEMBRANE_HMAC_KEY` (base64 of 32 bytes each; generate with `openssl rand -base64 32`). If neither is set, ARTEX generates `membrane.keys` (0600) next to `jwt.key` in the install directory. **Docker deployments must set both in `.env`**: the container's install directory is not a volume, so a generated file is lost when the container is recreated. Back the keys up — without them the stored mapping cannot be decrypted and remote LLM calls fail closed. ARTEX refuses to generate new keys while the mapping table already has entries. `ARTEX_MEMBRANE=off` disables the membrane (audited).
+
 **Concurrency**: the number of work agents per task is configured in "System Settings" (default 3).
 
 **Common flags**: `./start.sh -addr :8787 -proxy :8788` (`-addr` frontend+API, `-proxy` traffic recording proxy). The startup script passes arguments through to `artex` verbatim.

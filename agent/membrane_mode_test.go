@@ -216,3 +216,40 @@ func (f *memPersist) AllocateMembraneBlock(string, int) (string, error) {
 }
 
 func (f *memPersist) ListMembraneBlocks() ([]db.MembraneBlock, error) { return nil, nil }
+
+// A provider that skips the membrane because its base URL is a local model
+// must not follow a redirect to a remote host: the 307/308 would carry the
+// unmembraned body there. Redirects to another local host still work.
+func TestNewProviderLocalRefusesRemoteRedirect(t *testing.T) {
+	t.Setenv("ARTEX_MEMBRANE", "")
+	okBody := `{"id":"m","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+	var finalHits int
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		finalHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(okBody))
+	}))
+	t.Cleanup(final.Close)
+	target := "http://remote-llm.invalid"
+	redir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redir.Close)
+
+	req := llm.CompletionRequest{MaxTokens: 16, Messages: []llm.Message{{Role: llm.RoleUser,
+		Content: []llm.ContentBlock{{Type: llm.BlockText, Text: "secret prompt"}}}}}
+	c := ConfigFrom("anthropic", "m", redir.URL, "k", "")
+	c.Retry.ConnectAttempts = -1
+	prov, err := c.NewProvider()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := prov.Complete(context.Background(), req); err == nil || !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("redirect to a remote host must be refused, err = %v", err)
+	}
+
+	target = final.URL // local → local is fine
+	if _, _, _, err := prov.Complete(context.Background(), req); err != nil || finalHits != 1 {
+		t.Fatalf("local redirect: err=%v hits=%d", err, finalHits)
+	}
+}

@@ -2,11 +2,20 @@ package server
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/membrane"
 	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+// Pinned membrane keys for the server test database (base64 of 32 bytes).
+var (
+	testMembraneEncKey  = base64.StdEncoding.EncodeToString([]byte(strings.Repeat("e", 32)))
+	testMembraneHMACKey = base64.StdEncoding.EncodeToString([]byte(strings.Repeat("h", 32)))
 )
 
 // TestMain acquires a PostgreSQL advisory lock (7337741002) for the entire
@@ -17,6 +26,10 @@ func TestMain(m *testing.M) {
 	// contending on shared tables and the advisory lock below stops
 	// serializing go test ./... across packages.
 	db.SuffixTestDatabase("server")
+	// Every server test opens the same membrane table: pin its keys so no
+	// test generates its own and finds rows it cannot decrypt.
+	os.Setenv(membrane.EnvEncKey, testMembraneEncKey)   //nolint:errcheck
+	os.Setenv(membrane.EnvHMACKey, testMembraneHMACKey) //nolint:errcheck
 	dsn, _, err := db.DSN()
 	if err != nil {
 		os.Exit(m.Run())

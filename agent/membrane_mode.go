@@ -2,6 +2,7 @@ package agent
 
 import (
 	"errors"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
@@ -24,6 +25,19 @@ func MembraneOverride() bool { return os.Getenv(MembraneEnv) == "off" }
 // membraneRequiredFn is the test hook NewProvider consults (tests force it
 // to true for a local httptest server).
 var membraneRequiredFn = MembraneRequired
+
+// refuseUntrustedRedirect is the CheckRedirect of providers built without the
+// membrane: a redirect may only lead to another host that would not need the
+// membrane either (same rule as MembraneRequired, so the override allows all).
+func refuseUntrustedRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("llm: stopped after 10 redirects")
+	}
+	if membraneRequiredFn(req.URL.String()) {
+		return errors.New("llm: redirect from a local model endpoint to a non-local host refused (it would bypass the identity membrane)")
+	}
+	return nil
+}
 
 // MembraneRequired reports whether a provider at baseURL must go through the
 // membrane. Trust is derived, not set: it is false only when the host is a
