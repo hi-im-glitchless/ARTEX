@@ -23,6 +23,9 @@ type Match struct {
 type Automaton struct {
 	nodes []acNode
 	pats  []acPattern
+	// seam: some pattern contains leakSeam, so a match can straddle a
+	// LeakCheck segment cut.
+	seam bool
 }
 
 type acPattern struct {
@@ -125,6 +128,7 @@ func lowerASCII(s string) string {
 func buildAutomaton(pats []acPattern) *Automaton {
 	a := &Automaton{nodes: []acNode{{}}, pats: pats}
 	for id, p := range pats {
+		a.seam = a.seam || strings.Contains(p.text, leakSeam)
 		cur := int32(0)
 		for _, c := range []byte(lowerASCII(p.text)) {
 			nx, ok := a.nodes[cur].next[c]
@@ -184,6 +188,9 @@ func (a *Automaton) Len() int {
 // only at token boundaries, longer ones also inside compounds (ruling R10).
 // A nil Automaton matches nothing.
 func (a *Automaton) FindAll(text string) []Match { return a.findAll(text, nil) }
+
+// any reports whether some pattern matches in text.
+func (a *Automaton) any(text string) bool { return len(a.findAll(text, nil)) > 0 }
 
 // findAll is FindAll restricted to patterns whose kind accept allows.
 func (a *Automaton) findAll(text string, accept func(Kind) bool) []Match {

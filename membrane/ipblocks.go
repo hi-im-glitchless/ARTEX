@@ -122,7 +122,7 @@ func (s *Store) allocate(real netip.Prefix) (ipBlock, error) {
 		}
 	}
 	s.blocks = append(s.blocks, b)
-	s.gen.Add(1)
+	s.bump(storeChange{prefixes: []netip.Prefix{b.real, b.alias}})
 	return b, nil
 }
 

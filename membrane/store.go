@@ -133,6 +133,9 @@ type Store struct {
 	gen atomic.Uint64
 	// aliasGen counts changes to the alias set only (rdict rebuilds).
 	aliasGen atomic.Uint64
+	// changes describes each generation step (see delta.go).
+	chMu    sync.Mutex
+	changes []storeChange
 }
 
 // generation returns the store's change counter.
@@ -275,7 +278,7 @@ func (s *Store) reload() error {
 	s.phoneOrig, s.phoneAlias = fresh.phoneOrig, fresh.phoneAlias
 	s.blocks = fresh.blocks
 	s.dict, s.dictDirty = nil, true
-	s.gen.Add(1)
+	s.bump(storeChange{full: true})
 	s.aliasGen.Add(1)
 	s.mu.Unlock()
 	return nil
@@ -326,7 +329,7 @@ func (s *Store) indexEntry(e *entry) {
 		}
 	}
 	s.dictDirty = true
-	s.gen.Add(1)
+	s.bump(entryChange(e))
 	s.aliasGen.Add(1)
 }
 
@@ -852,6 +855,7 @@ func (s *Store) retireAlias(e *entry, newAlias string) error {
 		return fmt.Errorf("membrane re-mint %s entry %d: %w", e.kind, e.id, err)
 	}
 	s.mu.Lock()
+	old := e.alias
 	e.retired = append(append([]string(nil), e.retired...), e.alias)
 	e.alias = newAlias
 	s.indexAlias(e, newAlias)
@@ -859,7 +863,7 @@ func (s *Store) retireAlias(e *entry, newAlias string) error {
 		s.roots[e.norm] = newAlias
 	}
 	s.dictDirty = true
-	s.gen.Add(1)
+	s.bump(storeChange{needles: []string{e.original, e.norm, old, newAlias}})
 	s.aliasGen.Add(1)
 	s.mu.Unlock()
 	return nil
@@ -1055,7 +1059,7 @@ func (s *Store) MarkModelKnown(domain string) {
 	s.mu.Lock()
 	if !s.modelKnown[d] {
 		s.modelKnown[d] = true
-		s.gen.Add(1)
+		s.bump(storeChange{needles: []string{d}})
 	}
 	s.mu.Unlock()
 }

@@ -139,7 +139,7 @@ var (
 	seedProv    = Provenance{CompanyIDs: []int64{1}, TaskIDs: []int64{7}, Source: "seed"}
 )
 
-func newTestStore(t *testing.T) (*Store, *fakePersistence) {
+func newTestStore(t testing.TB) (*Store, *fakePersistence) {
 	t.Helper()
 	p := &fakePersistence{}
 	s, err := OpenStore(p, testEncKey, testHMACKey)

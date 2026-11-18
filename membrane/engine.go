@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net/netip"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Engine rewrites text between the real universe and the alias universe:
@@ -24,6 +26,16 @@ type Engine struct {
 	// must never enrol as real when the block reason comes back.
 	rejMu    sync.Mutex
 	rejected map[string]struct{}
+
+	// leaks caches LeakCheck results per body segment (see LeakCheck).
+	leaks *leakCache
+	// deltas memoises change matchers by (from, to) generation.
+	deltaMu sync.Mutex
+	deltas  map[[2]uint64]*deltaMatcher
+	// passes counts full transform passes (tests).
+	passes atomic.Int64
+	// leakScans counts uncached LeakCheck segment scans (tests).
+	leakScans atomic.Int64
 }
 
 // NewEngine returns an engine over s (required). p may be nil
@@ -32,7 +44,7 @@ func NewEngine(s *Store, p *Pipeline) *Engine {
 	if p == nil {
 		p = NewPipeline(s)
 	}
-	return &Engine{s: s, p: p, cache: newToModelCache()}
+	return &Engine{s: s, p: p, cache: newToModelCache(), leaks: newLeakCache()}
 }
 
 // Report summarises one ToModel call. Counts is per kind of replaced value,
@@ -134,18 +146,28 @@ func (e *Engine) toModelRole(text string, prov Provenance, assistant bool) (stri
 	}
 	key := cacheKey(text, prov, assistant)
 	g := e.generation()
-	if out, rep, ok := e.cache.get(key, g); ok {
-		return out, rep, nil
+	if ce, ok := e.cache.get(key); ok {
+		if ce.gen == g {
+			return ce.out, ce.rep, nil
+		}
+		// Generation moved: reuse the result unless a change since it
+		// was computed touches this text (delta.go).
+		if cur, ok := e.stillValid(text, ce.gen); ok {
+			e.cache.revalidate(key, ce.gen, cur)
+			return ce.out, ce.rep, nil
+		}
 	}
 	out, rep, err := e.toModel(text, prov, assistant)
 	if err != nil {
 		return "", Report{}, err
 	}
-	// Cache only results computed against a stable table: when this call
-	// (or another goroutine) enrolled something, the next identical call
-	// recomputes once (with Enrolled 0) and caches that.
-	if e.generation() == g {
-		e.cache.put(key, g, out, rep)
+	// A result is cached at the generation read before computing it: any
+	// change made meanwhile (by another goroutine) is after that generation
+	// and is checked against the text on the next lookup. A call that
+	// enrolled something is not cached: the next identical call recomputes
+	// once (with Enrolled 0) and caches that.
+	if rep.Enrolled == 0 {
+		e.cache.put(key, g, text, out, rep)
 	}
 	return out, rep, nil
 }
@@ -187,6 +209,7 @@ func (e *Engine) toModel(text string, prov Provenance, assistant bool) (string, 
 }
 
 func (e *Engine) transformPass(text string, prov Provenance, assistant bool) (string, Report, error) {
+	e.passes.Add(1)
 	rep := newReport()
 	var b strings.Builder
 	last := 0
@@ -725,8 +748,88 @@ func (e *Engine) inMintedEmail(text string, sh shape) bool {
 // decoded views) for any enrolled original: the dictionary of originals,
 // plus enrolled public IP addresses (which the dictionary leaves to the
 // address detectors). Hits are ordered by offset and carry no value.
+//
+// The body is scanned in segments cut between "}" and ",{" (message and
+// block boundaries of a serialised request, or any other place those bytes
+// occur), at least leakSegMin bytes long, and each segment's hits are cached
+// like ToModel results (revalidated against the store changes since). This
+// is exact: every detector and view decodes locally, the text edge is a
+// boundary like "}" and ",", and no escape covers either byte, so a hit
+// straddling a cut would have to contain "}," itself; when an enrolled
+// original or alias does, the body is scanned whole.
 func (e *Engine) LeakCheck(serialised []byte) []LeakHit {
 	text := string(serialised)
+	cuts := leakCuts(text)
+	if len(cuts) == 0 || e.s.Dictionary().seam || e.s.ReverseDictionary().seam {
+		return e.leakSegment(text)
+	}
+	var hits []LeakHit
+	prev := 0
+	for _, c := range append(cuts, len(text)) {
+		for _, h := range e.leakSegment(text[prev:c]) {
+			h.Offset += prev
+			hits = append(hits, h)
+		}
+		prev = c
+	}
+	sortHits(hits)
+	return hits
+}
+
+// leakSeam is the byte pair LeakCheck segments are cut between.
+const leakSeam = "},"
+
+// leakSegMin is the minimum LeakCheck segment length.
+const leakSegMin = 16 << 10
+
+// leakCuts returns the segment cut positions of text: the "," of a "},{"
+// at least leakSegMin bytes after the previous cut.
+func leakCuts(text string) []int {
+	var cuts []int
+	prev := 0
+	for i := prev + leakSegMin; i < len(text); {
+		j := strings.Index(text[i:], "},{")
+		if j < 0 {
+			break
+		}
+		c := i + j + 1
+		cuts = append(cuts, c)
+		prev = c
+		i = prev + leakSegMin
+	}
+	return cuts
+}
+
+// leakSegment returns the (cached) hits of one segment.
+func (e *Engine) leakSegment(seg string) []LeakHit {
+	key := sha256.Sum256([]byte(seg))
+	g := e.generation()
+	if gen, hits, ok := e.leaks.get(key); ok {
+		if gen == g {
+			return slices.Clone(hits)
+		}
+		if cur, ok := e.stillValid(seg, gen); ok {
+			e.leaks.revalidate(key, gen, cur)
+			return slices.Clone(hits)
+		}
+	}
+	hits := e.leakCheckFull(seg)
+	e.leaks.put(key, g, seg, slices.Clone(hits))
+	return hits
+}
+
+func sortHits(hits []LeakHit) {
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].Offset != hits[j].Offset {
+			return hits[i].Offset < hits[j].Offset
+		}
+		return hits[i].Kind < hits[j].Kind
+	})
+}
+
+// leakCheckFull is LeakCheck without segments or cache.
+func (e *Engine) leakCheckFull(text string) []LeakHit {
+	e.leakScans.Add(1)
 	dict := e.s.Dictionary()
 	seen := map[LeakHit]bool{}
 	var hits []LeakHit
@@ -785,12 +888,7 @@ func (e *Engine) LeakCheck(serialised []byte) []LeakHit {
 		scan(v.text, func(i int) int { return v.rs[i] })
 		tokens(v.text, func(i int) int { return v.rs[i] })
 	}
-	sort.Slice(hits, func(i, j int) bool {
-		if hits[i].Offset != hits[j].Offset {
-			return hits[i].Offset < hits[j].Offset
-		}
-		return hits[i].Kind < hits[j].Kind
-	})
+	sortHits(hits)
 	return hits
 }
 

@@ -15,7 +15,7 @@ import (
 // newTestEngine returns an engine over a fresh store seeded with the Acme
 // Bank fixture: root domain, two org keywords, a /22 scope CIDR and the task
 // credentials.
-func newTestEngine(t *testing.T) (*Engine, *Store) {
+func newTestEngine(t testing.TB) (*Engine, *Store) {
 	t.Helper()
 	s, _ := newTestStore(t)
 	for _, e := range []struct {

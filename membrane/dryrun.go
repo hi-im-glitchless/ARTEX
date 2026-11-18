@@ -196,7 +196,7 @@ func (s *Store) dryClone() *Store {
 // The view is meant for one preview and then dropped.
 func (e *Engine) WithDryRun() *Engine {
 	c := e.s.dryClone()
-	d := &Engine{s: c, p: e.p.rebind(c), cache: newToModelCache(), rejected: map[string]struct{}{}}
+	d := &Engine{s: c, p: e.p.rebind(c), cache: newToModelCache(), leaks: newLeakCache(), rejected: map[string]struct{}{}}
 	e.rejMu.Lock()
 	maps.Copy(d.rejected, e.rejected)
 	e.rejMu.Unlock()

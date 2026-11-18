@@ -124,6 +124,9 @@ func (e *Engine) ToModelJSON(raw json.RawMessage, prov Provenance) (json.RawMess
 // message) must also be replaced in the strings already passed: an
 // alias-shaped real value is only replaced by lookalikes, which skip it
 // while it is not enrolled (guard block reasons). Enrolled sums all passes.
+// A rerun after a change elsewhere (another task's enrolment) is cheap: each
+// string's cached result is revalidated against the changes since (delta.go)
+// and only strings a change touches are transformed again.
 func (e *Engine) untilStable(pass func() (Report, error)) (Report, error) {
 	enrolled := 0
 	for n := 1; ; n++ {
