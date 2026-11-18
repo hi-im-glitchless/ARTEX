@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 )
 
 // MembraneEnv is the only override of the identity membrane: the exact value
@@ -19,8 +20,25 @@ const MembraneEnv = "ARTEX_MEMBRANE"
 // example because the store failed to open). No request is possible.
 var ErrMembraneNotInitialised = errors.New("membrane required but not initialised")
 
-// MembraneOverride reports whether ARTEX_MEMBRANE=off is set.
-func MembraneOverride() bool { return os.Getenv(MembraneEnv) == "off" }
+// overrideRefused is set when ARTEX_MEMBRANE=off could not be audited: the
+// override then does not take effect (spec §10: every unmembraned run must
+// be on record).
+var overrideRefused atomic.Bool
+
+// MembraneOverride reports whether ARTEX_MEMBRANE=off is set and in effect
+// (not refused by SetMembraneOverrideRefused).
+func MembraneOverride() bool {
+	return MembraneOverrideRequested() && !overrideRefused.Load()
+}
+
+// MembraneOverrideRequested reports whether ARTEX_MEMBRANE=off is set, in
+// effect or not.
+func MembraneOverrideRequested() bool { return os.Getenv(MembraneEnv) == "off" }
+
+// SetMembraneOverrideRefused makes the override ineffective (true) or lets
+// it take effect again (false). The server refuses an override it cannot
+// audit; remote providers then need the membrane and fail closed.
+func SetMembraneOverrideRefused(refused bool) { overrideRefused.Store(refused) }
 
 // membraneRequiredFn is the test hook NewProvider consults (tests force it
 // to true for a local httptest server).

@@ -443,15 +443,17 @@ func (d *DB) PurgeMembraneCompany(companyID int64) (int, error) {
 	return n, tx.Commit()
 }
 
-func purgeMembraneCompanyTx(tx *sql.Tx, companyID int64) (int, error) {
-	res, err := tx.Exec(`
-DELETE FROM membrane_entries e
-WHERE e.company_ids = ARRAY[$1]::bigint[]
+// purgeableEntry matches the membrane_entries rows e a purge of company $1
+// deletes: referenced only by it, with no task linked to another company.
+const purgeableEntry = `e.company_ids = ARRAY[$1]::bigint[]
   AND NOT EXISTS (
       SELECT 1 FROM unnest(e.task_ids) t JOIN tasks k ON k.id = t
       WHERE (k.company_id IS NOT NULL AND k.company_id <> $1)
          OR EXISTS (SELECT 1 FROM task_scope ts WHERE ts.task_id = k.id
-                    AND ts.kind = 'company' AND ts.company_id <> $1))`, companyID)
+                    AND ts.kind = 'company' AND ts.company_id <> $1))`
+
+func purgeMembraneCompanyTx(tx *sql.Tx, companyID int64) (int, error) {
+	res, err := tx.Exec(`DELETE FROM membrane_entries e WHERE `+purgeableEntry, companyID)
 	if err != nil {
 		return 0, err
 	}
@@ -493,6 +495,12 @@ func membraneCompanyReferences(q rowQuerier, companyID int64) (map[string]int, e
 		{"lessons", `SELECT count(*) FROM rsi_lessons WHERE company_id=$1`},
 		{"scope", `SELECT count(*) FROM company_scope WHERE company_id=$1`},
 		{"company", `SELECT count(*) FROM companies WHERE id=$1`},
+		// Deleting a company drops its task_scope links and NULLs
+		// tasks.company_id, so its live tasks stop counting under "tasks";
+		// their values would still be purged and could then leave in clear.
+		{"live_tasks", `SELECT count(DISTINCT k.id) FROM membrane_entries e
+			CROSS JOIN LATERAL unnest(e.task_ids) t JOIN tasks k ON k.id = t
+			WHERE k.deleted_at IS NULL AND ` + purgeableEntry},
 	}
 	for _, x := range queries {
 		var n int

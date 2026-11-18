@@ -84,8 +84,11 @@ func runMembrane(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "checked=%d failed=%d chain=%s\n", res.Checked, res.Failed, chain)
 	fmt.Fprintf(stdout, "result=%s forwarded=%d paired=%d unpaired=%d\n", res.Result, res.Forwarded, res.Paired, res.Unpaired)
-	if res.NoRaw > 0 || res.Unmembraned > 0 {
-		fmt.Fprintf(stdout, "no_raw=%d unmembraned=%d\n", res.NoRaw, res.Unmembraned)
+	if res.NoRaw > 0 || res.Unmembraned > 0 || res.Blocked > 0 {
+		fmt.Fprintf(stdout, "no_raw=%d unmembraned=%d blocked=%d\n", res.NoRaw, res.Unmembraned, res.Blocked)
+	}
+	if res.Reason != "" {
+		fmt.Fprintln(stdout, "reason: "+res.Reason)
 	}
 	if res.Failed > 0 {
 		ids := make([]string, len(res.FailedIDs))

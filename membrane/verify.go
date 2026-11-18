@@ -3,6 +3,7 @@ package membrane
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -44,7 +45,10 @@ const VerifyNote = "Verification re-scans the recorded wire bytes with the membr
 // Paired those with a scanned record, Unpaired the rest. Result is "fail"
 // when a record failed or the chain is broken, else "inconclusive" when a
 // forwarded request has no scanned record (recording off, or records
-// missing), else "pass". ChainOK and ChainFirstBadID come from the audit
+// missing) or when nothing went through the membrane but unmembraned
+// records exist (an override run or a trusted local profile), else "pass".
+// Blocked counts records of calls the membrane refused (no hash, a
+// membrane error): never forwarded, not scanned. ChainOK and ChainFirstBadID come from the audit
 // chain check, which Verify itself does not run (VerifyTask does).
 type VerifyResult struct {
 	Result          string         `json:"result"`
@@ -54,12 +58,15 @@ type VerifyResult struct {
 	FailedKinds     map[string]int `json:"failed_kinds"`
 	NoRaw           int            `json:"no_raw"`
 	Unmembraned     int            `json:"unmembraned"`
+	Blocked         int            `json:"blocked"`
 	Forwarded       int            `json:"forwarded"`
 	Paired          int            `json:"paired"`
 	Unpaired        int            `json:"unpaired"`
 	ChainOK         bool           `json:"chain_ok"`
 	ChainFirstBadID int64          `json:"chain_first_bad_id,omitempty"`
-	Note            string         `json:"note"`
+	// Reason explains an inconclusive or failed result (counts only).
+	Reason string `json:"reason,omitempty"`
+	Note   string `json:"note"`
 }
 
 // OK reports whether the verification passed: nothing failed, the chain is
@@ -71,10 +78,27 @@ func (r *VerifyResult) finish() {
 	switch {
 	case r.Failed > 0 || !r.ChainOK:
 		r.Result = VerifyFail
+		var why []string
+		if r.Failed > 0 {
+			why = append(why, fmt.Sprintf("%d recorded request(s) hold an enrolled original", r.Failed))
+		}
+		if !r.ChainOK {
+			why = append(why, "the audit chain is broken")
+		}
+		r.Reason = strings.Join(why, "; ")
 	case r.Unpaired > 0 || (r.Forwarded > 0 && r.Checked == 0):
 		r.Result = VerifyInconclusive
+		r.Reason = fmt.Sprintf("%d of %d forwarded request(s) have no recorded wire body paired with their audit event (recording off or records missing)",
+			r.Unpaired, r.Forwarded)
+	case r.Forwarded == 0 && r.Unmembraned > 0:
+		r.Result = VerifyInconclusive
+		r.Reason = fmt.Sprintf("no request was forwarded through the membrane, but %d recorded request(s) bypassed it (ARTEX_MEMBRANE=off or a trusted local profile)",
+			r.Unmembraned)
 	default:
 		r.Result = VerifyPass
+		if r.Forwarded == 0 {
+			r.Reason = "no request was forwarded through the membrane for this task: nothing to re-scan"
+		}
 	}
 	r.Note = VerifyNote
 }
@@ -158,7 +182,11 @@ func verifyTask(e *Engine, src VerifySource, taskID string, evs []db.MembraneEve
 		for _, p := range page {
 			after = p.ID
 			if p.MembraneHash == "" {
-				res.Unmembraned++
+				if p.MembraneRefused {
+					res.Blocked++
+				} else {
+					res.Unmembraned++
+				}
 				continue
 			}
 			if p.Raw != "" && want[p.MembraneHash] > 0 {

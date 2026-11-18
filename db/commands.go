@@ -361,6 +361,9 @@ type LLMRawRequest struct {
 	// MembraneHash is the record's membrane_request_sha256 (empty when the
 	// call did not go through the membrane).
 	MembraneHash string
+	// MembraneRefused reports a failed call whose error is a membrane
+	// refusal (blocked or not sent): it never reached the provider.
+	MembraneRefused bool
 }
 
 // LLMRawRequests pages the records of one exact task_id in id order (keyset:
@@ -369,7 +372,8 @@ func (d *DB) LLMRawRequests(taskID string, afterID int64, limit int) ([]LLMRawRe
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := d.Query(`SELECT id, COALESCE(profile_name,''), COALESCE(raw_request,''), COALESCE(membrane_request_sha256,'') FROM llm_records
+	rows, err := d.Query(`SELECT id, COALESCE(profile_name,''), COALESCE(raw_request,''), COALESCE(membrane_request_sha256,''),
+		(COALESCE(status,'') = 'error' AND COALESCE(error,'') LIKE '%membrane: %') FROM llm_records
 		WHERE COALESCE(task_id,'') = $1 AND id > $2 ORDER BY id LIMIT $3`, taskID, afterID, limit)
 	if err != nil {
 		return nil, err
@@ -378,7 +382,7 @@ func (d *DB) LLMRawRequests(taskID string, afterID int64, limit int) ([]LLMRawRe
 	var out []LLMRawRequest
 	for rows.Next() {
 		var r LLMRawRequest
-		if err := rows.Scan(&r.ID, &r.Profile, &r.Raw, &r.MembraneHash); err != nil {
+		if err := rows.Scan(&r.ID, &r.Profile, &r.Raw, &r.MembraneHash, &r.MembraneRefused); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

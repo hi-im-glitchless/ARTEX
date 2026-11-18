@@ -298,12 +298,15 @@ func BuildEvidence(in EvidenceInput) (markdown string, jsonDoc []byte) {
 	}
 	switch v.Result {
 	case VerifyPass:
-		d.Proof.Statement = "Offline verification passed: every forwarded request's recorded wire body was re-scanned and no enrolled original was found, and the audit chain is intact."
+		if v.Forwarded == 0 {
+			d.Proof.Statement = "No request was forwarded to a remote model through the membrane for this task, so there was nothing to re-scan; the audit chain is intact. This shows no membrane traffic, not that membraned traffic was verified."
+		} else {
+			d.Proof.Statement = "Offline verification passed: every forwarded request's recorded wire body was re-scanned and no enrolled original was found, and the audit chain is intact."
+		}
 	case VerifyFail:
 		d.Proof.Statement = "Offline verification FAILED: see the failed record ids and kinds, and the chain status."
 	case VerifyInconclusive:
-		d.Proof.Statement = fmt.Sprintf("Offline verification is INCONCLUSIVE: %d of %d forwarded requests have no recorded wire body paired with their audit event (recording was off, or records are missing), so they could not be re-scanned. No failure was found in what could be checked.",
-			v.Unpaired, v.Forwarded)
+		d.Proof.Statement = "Offline verification is INCONCLUSIVE: " + v.Reason + ". No failure was found in what could be checked."
 	default:
 		d.Proof.Statement = "Offline verification was not run."
 	}
@@ -407,8 +410,8 @@ func renderEvidenceMD(d *EvidenceDoc) string {
 		d.Proof.Level, strings.ToUpper(orDash(v.Result)), d.Proof.RequestHash)
 	w("- Forwarded requests: %d (with a request hash: %d); paired with a recorded wire body: %d; unpaired: %d\n",
 		v.Forwarded, d.Proof.RequestsHashed, v.Paired, v.Unpaired)
-	w("- Recorded wire bodies re-scanned: checked=%d failed=%d (membraned records without a body: %d, unmembraned records: %d)\n",
-		v.Checked, v.Failed, v.NoRaw, v.Unmembraned)
+	w("- Recorded wire bodies re-scanned: checked=%d failed=%d (membraned records without a body: %d, unmembraned records: %d, refused by the membrane and never forwarded: %d)\n",
+		v.Checked, v.Failed, v.NoRaw, v.Unmembraned, v.Blocked)
 	if v.Failed > 0 {
 		ids := make([]string, len(v.FailedIDs))
 		for i, id := range v.FailedIDs {
@@ -529,17 +532,20 @@ func TaskEvidence(e *Engine, src EvidenceSource, taskID string, now time.Time) (
 			in.Boots = append(in.Boots, b)
 		}
 	}
-	// "override" events matter only for history older than boot events:
-	// with a boot event before the period, every later boot is covered.
-	if last == nil {
-		if in.LegacyOverrides, err = src.MembraneEventsByDirection("override", from, to); err != nil {
-			return EvidenceInput{}, fmt.Errorf("membrane evidence: override events: %w", err)
-		}
-		if lo, err := src.MembraneLastEventAtOrBefore("override", from); err != nil {
-			return EvidenceInput{}, fmt.Errorf("membrane evidence: override events: %w", err)
-		} else if lo != nil {
-			in.LegacyOverrides = append([]db.MembraneEvent{*lo}, in.LegacyOverrides...)
-		}
+	// "override" events always count, whatever the boot history (a lost
+	// "start" event must not hide an override): every one inside the
+	// period, and the last one before it, unless a membraned boot was
+	// recorded after it and before the period (that boot ended its run;
+	// without this every later task would read as overridden forever).
+	if in.LegacyOverrides, err = src.MembraneEventsByDirection("override", from, to); err != nil {
+		return EvidenceInput{}, fmt.Errorf("membrane evidence: override events: %w", err)
+	}
+	lo, err := src.MembraneLastEventAtOrBefore("override", from)
+	if err != nil {
+		return EvidenceInput{}, fmt.Errorf("membrane evidence: override events: %w", err)
+	}
+	if lo != nil && !(last != nil && last.ID > lo.ID && !slices.Contains(last.Flags, StartFlagOverride)) {
+		in.LegacyOverrides = append([]db.MembraneEvent{*lo}, in.LegacyOverrides...)
 	}
 	if in.Verify, err = verifyTask(e, src, taskID, evs); err != nil {
 		return EvidenceInput{}, err

@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/membrane"
 )
 
@@ -43,38 +44,58 @@ type membraneState struct {
 // browsable workspace), and builds the engine and the DB auditor.
 //
 // With ARTEX_MEMBRANE=off it opens nothing, appends one "override" audit
-// event and logs a warning. When the store cannot be opened the server still
+// event (after the "start" event) and logs a warning; if either event
+// cannot be written the override is refused and remote providers fail
+// closed. When the store cannot be opened the server still
 // starts, but the engine stays nil, so every remote provider construction
 // fails closed with agent.ErrMembraneNotInitialised.
 func (s *Server) initMembrane(keyDir string) {
 	st := &s.mem
 	if s.m.pg != nil {
-		st.audit = membrane.NewDBAuditor(s.m.pg)
+		st.audit = membraneAuditorFor(s.m.pg)
 	}
+	agent.SetMembraneOverrideRefused(false)
+	override := agent.MembraneOverrideRequested()
 	// Every boot appends a "start" event saying whether the override is in
 	// force for this run (evidence bounds each run by the next start). A
 	// membrane that then fails to initialise fails closed, so "override:false"
-	// holds for it too.
+	// holds for it too. A failed write is only logged for a membraned boot.
+	var startErr error
 	if st.audit != nil {
 		flag := membrane.StartFlagMembraned
-		if agent.MembraneOverride() {
+		if override {
 			flag = membrane.StartFlagOverride
 		}
 		ev := membrane.Event{Direction: membrane.DirectionStart, Report: membrane.Report{Flags: []string{flag}}}
-		if err := st.audit.Record(context.Background(), ev); err != nil {
-			log.Printf("[membrane] start audit event failed: %v", err)
+		if startErr = st.audit.Record(context.Background(), ev); startErr != nil {
+			log.Printf("[membrane] start audit event failed: %v", startErr)
 		}
 	}
-	if agent.MembraneOverride() {
-		st.override = true
-		log.Printf("[membrane] WARNING: %s=off — the identity membrane is DISABLED; remote LLM providers receive real data", agent.MembraneEnv)
-		if st.audit == nil {
-			log.Printf("[membrane] override not audited: no database")
+	if override {
+		// An override that cannot be audited does not take effect: the
+		// evidence must be able to show every unmembraned run. The engine
+		// stays nil, so remote providers fail closed.
+		refuse := func(why string) {
+			agent.SetMembraneOverrideRefused(true)
+			st.err = agent.MembraneEnv + "=off refused: the override could not be audited (" + why +
+				"); the membrane is not initialised and remote LLM providers fail closed"
+			log.Printf("[membrane] %s", st.err)
+		}
+		switch {
+		case st.audit == nil:
+			refuse("no database")
+			return
+		case startErr != nil:
+			refuse("start event write failed")
 			return
 		}
 		if err := st.audit.Record(context.Background(), membrane.Event{Direction: "override"}); err != nil {
 			log.Printf("[membrane] override audit event failed: %v", err)
+			refuse("override event write failed")
+			return
 		}
+		st.override = true
+		log.Printf("[membrane] WARNING: %s=off — the identity membrane is DISABLED; remote LLM providers receive real data", agent.MembraneEnv)
 		return
 	}
 	if s.m.pg == nil {
@@ -121,6 +142,9 @@ func (s *Server) initMembrane(keyDir string) {
 	st.engine = membrane.NewEngine(store, nil)
 	log.Printf("[membrane] enabled: %d entries, keys from %s", store.Len(), src)
 }
+
+// membraneAuditorFor builds the server's membrane auditor (test seam).
+var membraneAuditorFor = func(pg *db.DB) membrane.Auditor { return membrane.NewDBAuditor(pg) }
 
 // attachMembrane gives cfg the server's membrane engine and auditor and the
 // profile name recorded in audit events. Every config handed to
