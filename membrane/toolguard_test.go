@@ -30,10 +30,10 @@ func TestToolCheckBlocksUnresolvedAlias(t *testing.T) {
 		`{"command":"curl https://ffffff.example/x"}`,
 		`{"command":"curl https://api.ffffff.example/x"}`,
 		`{"command":"echo ORG-ffff"}`,
-		`{"command":"ping6 2001:db8::dead"}`,
+		`{"command":"ping6 2001:db8:1a2b:3c4d:5e6f:7a8b:9c0d:e1f2"}`,
 		`{"command":"nmap 240.9.9.9"}`,
 		// JSON-escaped and URL-encoded forms are decoded first.
-		`{"command":"nmap 240.9.9.9"}`,
+		"{\"command\":\"nmap \\u0032\\u0034\\u0030.9.9.9\"}",
 		`{"url":"http://x/?h=240%2E9%2E9%2E9"}`,
 		// Object keys count too.
 		`{"240.9.9.9":"x"}`,
@@ -45,12 +45,16 @@ func TestToolCheckBlocksUnresolvedAlias(t *testing.T) {
 			t.Errorf("%s: got block=%v reason=%q", in, block, reason)
 		}
 	}
-	// The rule applies to every tool, web_search included, even without the
-	// originals rule.
-	if !e.CheckTool("web_search", searchInput("ORG-ffff breach"), false).Block {
-		t.Error("unresolved alias in a web_search query must block")
+	// The rule applies to web_search too (alias reason first).
+	if v := e.CheckTool("web_search", searchInput("ORG-ffff breach"), true); !v.Block || v.Rule != RuleUnresolvedAlias {
+		t.Errorf("unresolved alias in a web_search query: %+v", v)
 	}
-	v := e.CheckTool("Bash", bashInput("nmap 240.9.9.9"), false)
+	// R19 amended: an agent on a local provider never sees aliases; nothing
+	// blocks there.
+	if v := e.CheckTool("Bash", bashInput("nmap 240.9.9.9"), false); v.Block {
+		t.Errorf("blocked for a local provider: %+v", v)
+	}
+	v := e.CheckTool("Bash", bashInput("nmap 240.9.9.9"), true)
 	if v.Rule != RuleUnresolvedAlias {
 		t.Errorf("rule %q", v.Rule)
 	}
@@ -138,11 +142,11 @@ func TestWebSearchBlocksOriginal(t *testing.T) {
 			t.Errorf("ToolCheck %q: block=%v reason=%q", q, block, reason)
 		}
 		// Escaped in the JSON input: still caught.
-		esc := []byte(`{"query":"` + strings.ReplaceAll(q, "a", `a`) + `"}`)
+		esc := []byte(`{"query":"` + strings.ReplaceAll(q, "a", "\\u0061") + `"}`)
 		if v := e.CheckTool("web_search", esc, true); !v.Block {
 			t.Errorf("escaped %q not blocked", q)
 		}
-		// R19: without the originals rule (local provider) only aliases block.
+		// R19: a local provider's searches are not checked.
 		if v := e.CheckTool("web_search", searchInput(q), false); v.Block {
 			t.Errorf("%q blocked without the web_search rule: %+v", q, v)
 		}

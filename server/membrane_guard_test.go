@@ -56,13 +56,13 @@ func TestMembraneToolGuardWiring(t *testing.T) {
 	if block, _ := remote("web_search", toolInput("query", "Spring Boot actuator CVE")); block {
 		t.Fatal("technology search blocked")
 	}
-	// A local provider: aliases still block, originals in searches do not.
+	// A local provider (R19 amended): neither rule applies.
 	local := s.membraneToolCheck(taskID, "planner", func() bool { return false })
 	if block, _ := local("web_search", toolInput("query", kw+" vpn login")); block {
 		t.Fatal("web_search rule applied to a local provider")
 	}
-	if block, _ := local("Bash", toolInput("command", "nmap "+alias)); !block {
-		t.Fatal("unresolved alias allowed for a local provider")
+	if block, _ := local("Bash", toolInput("command", "nmap 240.9.9.7")); block {
+		t.Fatal("alias rule applied to a local provider")
 	}
 
 	// Task worker guards built by the manager carry the check.
@@ -82,6 +82,9 @@ func TestMembraneToolGuardWiring(t *testing.T) {
 	localCfg := agent.ConfigFrom("openai", "m", "http://127.0.0.1:11434/v1", "k", "")
 	if block, _, _ := s.chatGuard(nil, localCfg).Hooks().PreToolUse(context.Background(), "web_search", toolInput("query", kw)); block {
 		t.Fatal("chat guard on a local model blocked an original search")
+	}
+	if block, _, _ := s.chatGuard(nil, localCfg).Hooks().PreToolUse(context.Background(), "Bash", toolInput("command", "nmap 240.9.9.8")); block {
+		t.Fatal("chat guard on a local model blocked an alias-shaped value")
 	}
 	remoteCfg := agent.ConfigFrom("anthropic", "m", "https://api.kimi.com/coding/v1", "k", "")
 	if block, _, _ := s.chatGuard(nil, remoteCfg).Hooks().PreToolUse(context.Background(), "web_search", toolInput("query", kw)); !block {

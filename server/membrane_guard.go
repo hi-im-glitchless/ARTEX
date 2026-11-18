@@ -16,11 +16,11 @@ import (
 // (spec §9.2/§9.3), or nil when the membrane is not active (override, or not
 // initialised: then no remote provider runs either).
 //
-// Ruling R19: the unresolved-alias rule applies whenever the engine exists
-// (a local model never sees aliases, so it costs nothing); the web_search
-// originals rule only when membraned reports the agent's provider is
-// membraned. membraned is evaluated per web_search call (the task's profile
-// can change at runtime); nil means always.
+// Ruling R19 (amended in Task 10 fix round 1): both rules, unresolved alias
+// and web_search originals, apply only when membraned reports the agent's
+// provider is membraned; a local model never sees aliases, so every block
+// there would be a false positive. membraned is evaluated per tool call (the
+// task's profile can change at runtime); nil means always.
 //
 // A block appends a "tool_block" membrane audit event carrying the rule only
 // (no values). An audit failure is logged: the call is blocked anyway.
@@ -31,8 +31,7 @@ func (s *Server) membraneToolCheck(taskID, role string, membraned func() bool) g
 	}
 	audit := s.membraneAuditor()
 	return func(tool string, input []byte) (bool, string) {
-		web := tool == membrane.WebSearchTool && (membraned == nil || membraned())
-		v := e.CheckTool(tool, input, web)
+		v := e.CheckTool(tool, input, membraned == nil || membraned())
 		if !v.Block {
 			return false, ""
 		}

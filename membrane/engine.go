@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // Engine rewrites text between the real universe and the alias universe:
@@ -18,6 +19,11 @@ type Engine struct {
 	s     *Store
 	p     *Pipeline
 	cache *toModelCache
+	// rejected holds the alias-shaped tokens the tool guard blocked
+	// (lowercase, bounded by maxRejected): invented values that lookalikes
+	// must never enrol as real when the block reason comes back.
+	rejMu    sync.Mutex
+	rejected map[string]struct{}
 }
 
 // NewEngine returns an engine over s (required). p may be nil
@@ -509,6 +515,12 @@ func (e *Engine) lookalikes(text string) []tmCand {
 		out = append(out, tmCand{Span: Span{Start: s, End: end, Kind: k, Value: text[s:end]}, look: true, added: true, prio: 1})
 	}
 	for _, sh := range scanShapes(text) {
+		// A token the tool guard rejected is an invented value, not a real
+		// one: it passes through unchanged (in this process via the rejected
+		// set; after a restart via the block reason around it).
+		if e.isRejected(sh.text) || inGuardReason(text, sh.Start, sh.End) {
+			continue
+		}
 		switch sh.kind {
 		case shapeHost:
 			if e.underMintedDomain(sh.text) {
