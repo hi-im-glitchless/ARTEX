@@ -1658,6 +1658,8 @@ export interface MembraneStatus {
   error?: string;
   /** Last startup seed sync failure (non-fatal; each task syncs again before its requests). */
   seed_error?: string;
+  /** Set when this boot generated the membrane keys: back them up or pin them in env. */
+  keys_warning?: string;
 }
 
 /** Pending task-scope row sent with a preview (only keyword/icp rows are seeded). */

@@ -28,7 +28,9 @@ services:
       ARTEX_LLM_BASE_URL: ${ARTEX_LLM_BASE_URL:-}
       ARTEX_LLM_PROXY: ${ARTEX_LLM_PROXY:-}
       # Identity membrane keys. Required in Docker: the generated key file would live in
-      # the container's writable layer (/app) and be lost on recreate. Back them up.
+      # the container's writable layer (/app) and be lost on recreate, so ARTEX refuses
+      # to generate keys inside a container (remote LLM calls fail closed until set).
+      # Back them up.
       ARTEX_MEMBRANE_KEY: ${ARTEX_MEMBRANE_KEY:-}
       ARTEX_MEMBRANE_HMAC_KEY: ${ARTEX_MEMBRANE_HMAC_KEY:-}
     ports:

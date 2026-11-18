@@ -2,7 +2,7 @@
 
 import * as React from "react";
 
-import { ShieldAlertIcon, ShieldOffIcon } from "lucide-react";
+import { KeyRoundIcon, ShieldAlertIcon, ShieldOffIcon } from "lucide-react";
 
 import { api } from "@/lib/api";
 import type { MembraneStatus } from "@/lib/types";
@@ -14,7 +14,9 @@ const POLL_MS = 60_000;
 // Global identity-membrane banner (spec §12), shown above every page:
 //   - red when ARTEX_MEMBRANE=off is in force: client data reaches the AI unprotected;
 //   - red when the membrane failed to initialise: every remote LLM call is refused, and the
-//     operator must see why (keys missing / mismatch, refused override, no database).
+//     operator must see why (keys missing / mismatch, refused override, no database);
+//   - amber when this boot generated the membrane keys: they live only in the key file and
+//     must be backed up or pinned in ARTEX_MEMBRANE_KEY / ARTEX_MEMBRANE_HMAC_KEY.
 // Nothing is shown while the status is unknown (request failed) or the membrane is healthy.
 export function MembraneBanner() {
   const [status, setStatus] = React.useState<MembraneStatus | null>(null);
@@ -54,6 +56,14 @@ export function MembraneBanner() {
         <span className="min-w-0 break-words">
           Membrane not initialised: {status.error?.trim() || "reason unknown"} — remote LLM calls are refused.
         </span>
+      </div>
+    );
+  }
+  if (status.keys_warning) {
+    return (
+      <div role="alert" className="flex items-start gap-2 bg-amber-500 px-4 py-2 font-medium text-sm text-black">
+        <KeyRoundIcon className="mt-0.5 size-4 shrink-0" />
+        <span className="min-w-0 break-words">{status.keys_warning}</span>
       </div>
     );
   }
