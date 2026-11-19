@@ -61,19 +61,22 @@ func (s *Store) bump(c storeChange) {
 }
 
 // entryChange describes the indexing of e.
+// Its needles are every dictionary spelling of e (forwardSpellings, shared
+// with patternsLocked), plus norm, alias and retired aliases.
 func entryChange(e *entry) storeChange {
-	c := storeChange{needles: []string{e.original, e.norm, e.alias}}
+	c := storeChange{needles: []string{e.norm, e.alias}}
 	c.needles = append(c.needles, e.retired...)
-	switch e.kind {
-	case KindIPv4, KindIPv6:
+	for _, sp := range forwardSpellings(e) {
+		c.needles = append(c.needles, sp.text)
+		if sp.alias != "" {
+			c.needles = append(c.needles, sp.alias)
+		}
+	}
+	if e.kind == KindIPv4 || e.kind == KindIPv6 {
 		for _, v := range append([]string{e.original, e.alias}, e.retired...) {
 			if a, err := netip.ParseAddr(v); err == nil {
 				c.addrs = append(c.addrs, a.Unmap())
 			}
-		}
-	case KindPhone:
-		for _, v := range phoneVariants(e) {
-			c.needles = append(c.needles, v[0], v[1])
 		}
 	}
 	return c

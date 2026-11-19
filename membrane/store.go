@@ -863,7 +863,11 @@ func (s *Store) retireAlias(e *entry, newAlias string) error {
 		s.roots[e.norm] = newAlias
 	}
 	s.dictDirty = true
-	s.bump(storeChange{needles: []string{e.original, e.norm, old, newAlias}})
+	// Every spelling the dictionary maps to the new alias (entryChange),
+	// plus the alias it replaces.
+	c := entryChange(e)
+	c.needles = append(c.needles, old)
+	s.bump(c)
 	s.aliasGen.Add(1)
 	s.mu.Unlock()
 	return nil
@@ -1172,18 +1176,42 @@ func (s *Store) patternsLocked() []acPattern {
 		if e.kind == KindIPv4 || e.kind == KindIPv6 {
 			continue
 		}
-		add(e, e.original)
-		for _, v := range phoneVariants(e) {
-			pats = append(pats, acPattern{text: v[0], original: v[0], kind: e.kind, alias: v[1],
-				caseSensitive: true, bound: boundDigits})
-		}
-		if e.kind == KindDomain {
-			if u, err := idna.Punycode.ToUnicode(e.norm); err == nil && u != e.norm {
-				add(e, u)
+		for _, sp := range forwardSpellings(e) {
+			if sp.phone {
+				pats = append(pats, acPattern{text: sp.text, original: sp.text, kind: e.kind, alias: sp.alias,
+					caseSensitive: true, bound: boundDigits})
+				continue
 			}
+			add(e, sp.text)
 		}
 	}
 	return pats
+}
+
+// spelling is one text under which the forward dictionary matches an entry.
+type spelling struct {
+	text  string
+	alias string // phone variants: the alias of this spelling
+	phone bool   // a phone variant (digit-bounded, case-sensitive pattern)
+}
+
+// forwardSpellings lists every spelling of e that patternsLocked turns into
+// a dictionary pattern: the original, the phone variants, and the Unicode
+// form of an IDN domain. It is the single source for both the dictionary
+// and the change log's needles (entryChange), so a cached ToModel or
+// LeakCheck result is invalidated by every spelling the dictionary would
+// now match (final review N1: the IDN Unicode form was missing).
+func forwardSpellings(e *entry) []spelling {
+	out := []spelling{{text: e.original}}
+	for _, v := range phoneVariants(e) {
+		out = append(out, spelling{text: v[0], alias: v[1], phone: true})
+	}
+	if e.kind == KindDomain {
+		if u, err := idna.Punycode.ToUnicode(e.norm); err == nil && u != e.norm {
+			out = append(out, spelling{text: u})
+		}
+	}
+	return out
 }
 
 // ReverseDictionary returns an immutable automaton over every alias
