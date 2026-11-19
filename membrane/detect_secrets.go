@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -32,7 +33,68 @@ func (secretDetector) Detect(text string) []Span {
 	out = optionSecrets(text, out)
 	out = append(out, gluedFlagSpans(text)...)
 	out = gitNameSpans(text, out)
-	return settleUserIDs(out)
+	return dropNoise(settleUserIDs(out))
+}
+
+// dropNoise removes credential spans whose value is tool noise rather than a
+// secret (live task 16): agent commands and their output put labels such as
+// "login:" or "password:" in front of curl write-out variables, HTTP status
+// codes and sizes, and code fragments. Enrolled, such a value matches all
+// over later requests: every "500" became a client username.
+func dropNoise(spans []Span) []Span {
+	out := spans[:0]
+	for _, sp := range spans {
+		if isCredentialKind(sp.Kind) && noiseValue(sp.Kind, sp.Value) {
+			continue
+		}
+		out = append(out, sp)
+	}
+	return out
+}
+
+// writeOutRE: a value made only of curl --write-out variables and separators
+// (%{http_code}, %{http_code}:%{size_download}).
+var writeOutRE = regexp.MustCompile(`^(?:%\{[A-Za-z_][A-Za-z0-9_.]*\}[^A-Za-z0-9%{}]*)+$`)
+
+// noiseValue reports a detected credential value that is not a secret:
+//   - curl write-out variables (%{http_code});
+//   - a $NAME reference carrying the backslash of an escaped quote
+//     (\"$TOKEN\" inside a JSON-encoded command): the quote it escapes makes
+//     it a shell string, where an upper-case $NAME is a reference;
+//   - placeholders, also with that backslash (<token from step 2>);
+//   - a code fragment as a username: brackets and fewer than two letters
+//     or digits ([n[ from users=[n['id'] ...]); punctuation-only
+//     credentials without brackets (usr=!!!) stay secrets;
+//   - a short number: below 4 digits for any credential, below 6 digits
+//     for a username. Status codes, sizes and counts printed after a label
+//     look like that; a real numeric password of 4+ digits (PIN) is kept.
+func noiseValue(k Kind, v string) bool {
+	t := strings.TrimSpace(v)
+	core := strings.TrimRight(t, `\`)
+	if core == "" || writeOutRE.MatchString(core) {
+		return true
+	}
+	if core != t && envVarRE.MatchString(core) && upperEnvName(core[1:]) {
+		return true
+	}
+	if core != t && placeholderValue(core) {
+		return true
+	}
+	if k == KindUsername && strings.ContainsAny(core, "[](){}") {
+		alnum := 0
+		for _, r := range core {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) {
+				alnum++
+			}
+		}
+		if alnum < 2 {
+			return true
+		}
+	}
+	if numericIDRE.MatchString(core) {
+		return len(core) < 4 || (k == KindUsername && len(core) < 6)
+	}
+	return false
 }
 
 // Glued credential options: the MySQL client family takes -u<user> and
@@ -583,6 +645,10 @@ var keyPrefixes = map[string]bool{
 // setting about it (auth_type, token_ttl, secret_name, user_namespace).
 var keyQualifiers = map[string]bool{
 	"type": true, "types": true, "mode": true, "ttl": true, "name": true, "names": true, "id": true, "ids": true,
+	// Prose about a credential, not the credential (task_credentials_note).
+	"note": true, "notes": true, "description": true, "desc": true, "message": true, "msg": true,
+	"comment": true, "comments": true, "help": true, "instructions": true, "instruction": true,
+	"label": true, "title": true, "summary": true, "reason": true, "error": true, "errors": true,
 	"ref": true, "policy": true, "endpoint": true, "url": true, "uri": true, "namespace": true, "ns": true,
 	"audience": true, "provider": true, "attribute": true, "attr": true, "header": true, "pool": true,
 	"method": true, "methods": true, "file": true, "path": true, "dir": true, "store": true, "agent": true,
@@ -900,8 +966,29 @@ func secretFormats(text, low string, out []Span) []Span {
 			out = append(out, sp)
 		}
 	}
+	for _, m := range lineMatches(credPairRE, text, lineHasAny(low, "pass", "pwd")) {
+		for _, g := range [][3]int{{m[2], m[3], 0}, {m[4], m[5], 1}} {
+			k := KindUsername
+			if g[2] == 1 {
+				k = KindPassword
+			}
+			ve := g[1]
+			for ve > g[0] && strings.IndexByte(".,;:)", text[ve-1]) >= 0 {
+				ve-- // sentence punctuation after the value
+			}
+			if sp, ok := valueSpanIn(text, g[0], ve, k, refKeyValue); ok {
+				out = append(out, sp)
+			}
+		}
+	}
 	return out
 }
+
+// credPairRE: a user and a password written together in free text, as an
+// operator does in a task goal ("username: layer8 / password: pentest123!",
+// "user: ana.costa, pass: Qw3rty!9"). A lone "user: x" in prose is not read:
+// only the pair makes the first value a login.
+var credPairRE = regexp.MustCompile(`(?i)\b(?:user(?:[ _-]?name)?|login|usr)[ \t]*[:=][ \t]*([^\s/,;'"<>&?]+)[ \t]*(?:/|,|;|\band\b)?[ \t]*\b(?:pass(?:word)?|passwd|pwd)[ \t]*[:=][ \t]*([^\s'"<>&]+)`)
 
 // headerRE finds "Name: " at a line start, after a JSON-escaped newline
 // (\n) or after a quote (curl -H "Name: v").

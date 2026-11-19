@@ -853,6 +853,9 @@ func (e *Engine) leakCheckFull(text string) []LeakHit {
 					continue hits // inside an alias: HMAC-derived, not a leak
 				}
 			}
+			if envelopeNumber(t, m.Start, m.End) {
+				continue // a request setting (max_tokens), not content
+			}
 			add(m.Kind, toRaw(m.Start))
 		}
 		for _, sp := range ipv6s(t, ipv4s(t, nil)) {
@@ -890,6 +893,48 @@ func (e *Engine) leakCheckFull(text string) []LeakHit {
 	}
 	sortHits(hits)
 	return hits
+}
+
+// envelopeKeys are request settings, in the canonical (Go field) and wire
+// spellings, lowercased. Their numeric values carry no client data and the
+// rewriter never touches them, so an enrolled number equal to one (a PIN
+// 4096 and max_tokens 4096) would otherwise block every request.
+var envelopeKeys = map[string]bool{
+	"maxtokens": true, "max_tokens": true, "max_completion_tokens": true, "max_output_tokens": true,
+	"maxoutputtokens": true, "dynamicboundary": true, "temperature": true, "top_p": true, "top_k": true,
+	"n": true, "seed": true, "budget_tokens": true, "frequency_penalty": true, "presence_penalty": true,
+}
+
+// envelopeNumber reports that t[s:e] is a whole JSON number value of an
+// envelopeKeys member ("max_tokens":4096).
+func envelopeNumber(t string, s, e int) bool {
+	for i := s; i < e; i++ {
+		if t[i] < '0' || t[i] > '9' {
+			return false
+		}
+	}
+	if e < len(t) && (t[e] == '.' || (t[e] >= '0' && t[e] <= '9')) {
+		return false
+	}
+	i := s - 1
+	for i >= 0 && (t[i] == ' ' || t[i] == '\t') {
+		i--
+	}
+	if i < 0 || t[i] != ':' {
+		return false
+	}
+	i--
+	for i >= 0 && (t[i] == ' ' || t[i] == '\t') {
+		i--
+	}
+	if i < 0 || t[i] != '"' {
+		return false
+	}
+	j := strings.LastIndexByte(t[:i], '"')
+	if j < 0 {
+		return false
+	}
+	return envelopeKeys[lowerASCII(t[j+1:i])]
 }
 
 // rootAliasRE matches the HMAC-derived part of a domain alias.
