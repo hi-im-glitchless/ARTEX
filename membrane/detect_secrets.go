@@ -309,10 +309,11 @@ func gluedOptions(text string, s, e int, user bool, out []Span) []Span {
 		}
 		vs, ve = vs+s, ve+s
 		v := text[vs:ve]
-		if strings.HasPrefix(v, "$") || strings.HasPrefix(v, "`") || portMapRE.MatchString(v) {
+		if portMapRE.MatchString(v) {
 			continue
 		}
-		if sp, ok := valueSpan(text, vs, ve, k); ok {
+		// -p$MYSQL_PWD is a reference; -p$ummer2024 a password (N2).
+		if sp, ok := valueSpanIn(text, vs, ve, k, refShell); ok {
 			out = append(out, sp)
 		}
 	}
@@ -480,7 +481,7 @@ func gitNameSpans(text string, out []Span) []Span {
 			continue
 		}
 		if vs, ve := valueGroup(m, 1); vs >= 0 {
-			if sp, ok := valueSpan(text, vs, ve, KindPerson); ok {
+			if sp, ok := valueSpanIn(text, vs, ve, KindPerson, refShell); ok {
 				out = append(out, sp)
 			}
 		}
@@ -637,15 +638,41 @@ func shapedValue(v string) bool {
 	return err == nil
 }
 
-// valueSpan builds a context secret span, or reports false when the value is
-// too short (min length 3) or shaped.
+// valueSpan builds a context secret span for a value written where nothing
+// expands '$' (refNever), or reports false when the value is too short (min
+// length 3), shaped or a placeholder.
 func valueSpan(text string, s, e int, k Kind) (Span, bool) {
+	return valueSpanIn(text, s, e, k, refNever)
+}
+
+// valueSpanIn is valueSpan for a value written in context ctx: there a
+// reference to a secret held elsewhere (referenceValue) is not a secret.
+func valueSpanIn(text string, s, e int, k Kind, ctx refContext) (Span, bool) {
 	v := text[s:e]
-	if utf8.RuneCountInString(v) < minLiteralLen || shapedValue(v) || placeholderValue(v) || referenceValue(v) {
+	if utf8.RuneCountInString(v) < minLiteralLen || shapedValue(v) || placeholderValue(v) || referenceValue(v, ctx) {
 		return Span{}, false
 	}
 	return Span{Start: s, End: e, Kind: k, Value: v}, true
 }
+
+// refContext is where a detected value was written. Whether a value that
+// starts with '$' refers to a secret held elsewhere or is the secret itself
+// depends on it (final review N2: "$ummer2024" is a password in JSON).
+type refContext uint8
+
+const (
+	// refNever: JSON values, HTML attributes, URL and query values, cookies,
+	// single-quoted Authorization headers, URL userinfo, config-file
+	// sections. Nothing expands '$' there, so a value is never a reference.
+	refNever refContext = iota
+	// refShell: a command line or shell assignment (KEY=value, export,
+	// --opt=value, --opt value, glued -pvalue, git config user.name v).
+	refShell
+	// refKeyValue: "key: value" lines (YAML, compose files, headers other
+	// than Authorization), where ${...}, $(...) and $UPPER_CASE are
+	// interpolations.
+	refKeyValue
+)
 
 // placeholderWords are type names and stock example values that sit in
 // secret fields of schemas, docs and templates ({"password": "string"}).
@@ -670,21 +697,49 @@ var placeholderWords = map[string]bool{
 }
 
 // referenceValue reports a value that refers to a secret held elsewhere
-// rather than being one: a shell command substitution ($(cmd ...), `cmd`),
-// a parameter expansion (${NAME...}) or a $NAME variable whose name is in
-// one case (PASS, DB_PASSWORD, token). The value as detected may be cut at
-// the first blank ("$(cat"), so only its start is examined. A mixed-case
-// $Name ($uperS3cret) is taken for a password that starts with '$'.
-func referenceValue(v string) bool {
+// rather than being one, given where it was written (final review N2):
+//
+//   - refNever: never. {"password":"$ECRET99"}, value="$ummer2024",
+//     ?password=%24ummer2024 and "Bearer $abc123" are the secrets.
+//   - refShell: a command substitution ($(cmd ...), `cmd`), a parameter
+//     expansion (${NAME...}), or $NAME where NAME is a plausible environment
+//     variable: all upper case (PASS, DB_PASSWORD, ECRET99) or all lower
+//     case with an underscore (db_pass). Any other $name ($ummer2024,
+//     $uperS3cret, $pass) is taken for a password that starts with '$': a
+//     real shell variable of that shape is aliased too, which costs nothing
+//     but an alias (it round-trips), while the other reading would leak a
+//     password in clear.
+//   - refKeyValue: ${...}, $(...) and $UPPER_CASE only. A bare
+//     Authorization header line is read this way (authorizationContext).
+//
+// The value as detected may be cut at the first blank ("$(cat"), so only
+// its start is examined.
+func referenceValue(v string, ctx refContext) bool {
+	if ctx == refNever {
+		return false
+	}
 	t := strings.TrimSpace(v)
-	if strings.HasPrefix(t, "$(") || strings.HasPrefix(t, "${") || strings.HasPrefix(t, "`") {
+	if strings.HasPrefix(t, "$(") || strings.HasPrefix(t, "${") {
+		return true
+	}
+	if ctx == refShell && strings.HasPrefix(t, "`") {
 		return true
 	}
 	if !envVarRE.MatchString(t) {
 		return false
 	}
 	name := t[1:]
-	return name == strings.ToUpper(name) || name == strings.ToLower(name)
+	if upperEnvName(name) {
+		return true
+	}
+	return ctx == refShell && name == strings.ToLower(name) && strings.Contains(name, "_") &&
+		strings.ContainsFunc(name, func(r rune) bool { return 'a' <= r && r <= 'z' })
+}
+
+// upperEnvName reports an all-upper-case variable name with at least one
+// letter (PASS, DB_PASSWORD; not "_" or "_1").
+func upperEnvName(name string) bool {
+	return name == strings.ToUpper(name) && strings.ContainsFunc(name, func(r rune) bool { return 'A' <= r && r <= 'Z' })
 }
 
 // placeholderValue reports a value that is a template or placeholder, not a
@@ -841,7 +896,7 @@ func secretFormats(text, low string, out []Span) []Span {
 			k = KindPassword
 		}
 		vs, ve := valueGroup(m, 2)
-		if sp, ok := valueSpan(text, vs, ve, k); ok {
+		if sp, ok := valueSpanIn(text, vs, ve, k, refKeyValue); ok {
 			out = append(out, sp)
 		}
 	}
@@ -884,6 +939,22 @@ func trimSpaces(text string, s, e int) (int, int) {
 	return s, e
 }
 
+// authorizationContext is where an Authorization value was written: inside
+// a double-quoted argument (curl -H "Authorization: Bearer $TOKEN") the
+// shell expands it; inside single quotes nothing does; a bare header line
+// (an HTTP dump, a log) is read like a key: value line, where only an
+// UPPER_CASE $NAME is taken for an interpolation ("Bearer $TOKEN") and
+// "Bearer $abc123def456" is a token (final review N2).
+func authorizationContext(quote byte) refContext {
+	switch quote {
+	case '"':
+		return refShell
+	case '\'':
+		return refNever
+	}
+	return refKeyValue
+}
+
 func headerSecrets(text string, out []Span) []Span {
 	for _, m := range lineMatches(headerRE, text, lineHas(text, ":")) {
 		var quote byte
@@ -903,7 +974,7 @@ func headerSecrets(text string, out []Span) []Span {
 		case "set-cookie":
 			out = cookiePairs(text, vs, ve, out, true)
 		case "authorization", "proxy-authorization":
-			out = authValue(text, vs, ve, out)
+			out = authValue(text, vs, ve, authorizationContext(quote), out)
 		default:
 			k, ok := keyKind(name)
 			if !ok {
@@ -913,19 +984,19 @@ func headerSecrets(text string, out []Span) []Span {
 			// string, quotes excluded.
 			if q := text[vs]; q == '"' || q == '\'' {
 				if c := strings.IndexByte(text[vs+1:ve], q); c >= 0 {
-					if sp, ok := valueSpan(text, vs+1, vs+1+c, k); ok {
+					if sp, ok := valueSpanIn(text, vs+1, vs+1+c, k, refKeyValue); ok {
 						out = append(out, sp)
 					}
 					continue
 				}
 			}
 			if k == KindToken {
-				out = authValue(text, vs, ve, out)
+				out = authValue(text, vs, ve, refKeyValue, out)
 				continue
 			}
 			// A passphrase is words: the whole value, to the end of line.
 			if strings.Contains(name, "passphrase") {
-				if sp, ok := valueSpan(text, vs, ve, k); ok {
+				if sp, ok := valueSpanIn(text, vs, ve, k, refKeyValue); ok {
 					out = append(out, sp)
 				}
 				continue
@@ -935,7 +1006,7 @@ func headerSecrets(text string, out []Span) []Span {
 			for e < ve && text[e] != ' ' && text[e] != '\t' {
 				e++
 			}
-			if sp, ok := valueSpan(text, vs, e, k); ok {
+			if sp, ok := valueSpanIn(text, vs, e, k, refKeyValue); ok {
 				out = append(out, sp)
 			}
 		}
@@ -977,11 +1048,12 @@ func cookiePairs(text string, s, e int, out []Span, setCookie bool) []Span {
 
 // authValue handles an Authorization-style value: "Basic <b64>" becomes an
 // EncBasicAuth span, "<Scheme> <credentials>" a token span on the
-// credentials, and a bare value a token span on the whole value.
-func authValue(text string, s, e int, out []Span) []Span {
+// credentials, and a bare value a token span on the whole value. ctx is
+// where the value was written (refNever for an Authorization header).
+func authValue(text string, s, e int, ctx refContext, out []Span) []Span {
 	sp := strings.IndexAny(text[s:e], " \t")
 	if sp < 0 {
-		if v, ok := valueSpan(text, s, e, KindToken); ok {
+		if v, ok := valueSpanIn(text, s, e, KindToken, ctx); ok {
 			out = append(out, v)
 		}
 		return out
@@ -993,7 +1065,7 @@ func authValue(text string, s, e int, out []Span) []Span {
 			return append(out, v)
 		}
 	}
-	if v, ok := valueSpan(text, cs, ce, KindToken); ok {
+	if v, ok := valueSpanIn(text, cs, ce, KindToken, ctx); ok {
 		out = append(out, v)
 	}
 	return out
@@ -1013,16 +1085,16 @@ func basicAuthSpan(text string, s, e int) (Span, bool) {
 	return Span{Start: s, End: e, Kind: KindPassword, Value: string(dec), Encoding: EncBasicAuth}, true
 }
 
-// plainValue reports an unencoded field value; token values may carry an
-// auth scheme ("Bearer x", "Basic b64").
-func plainValue(text string, s, e int, k Kind, out []Span) []Span {
+// plainValue reports an unencoded field value written in ctx; token values
+// may carry an auth scheme ("Bearer x", "Basic b64").
+func plainValue(text string, s, e int, k Kind, ctx refContext, out []Span) []Span {
 	if placeholderValue(text[s:e]) {
 		return out // checked whole, before a scheme split ({{ api_token }})
 	}
 	if k == KindToken {
-		return authValue(text, s, e, out)
+		return authValue(text, s, e, ctx, out)
 	}
-	if sp, ok := valueSpan(text, s, e, k); ok {
+	if sp, ok := valueSpanIn(text, s, e, k, ctx); ok {
 		out = append(out, sp)
 	}
 	return out
@@ -1040,14 +1112,14 @@ func jsonKeySecrets(text string, out []Span) []Span {
 		vs, ve := m[4], m[5]
 		raw := text[vs:ve]
 		if !strings.Contains(raw, `\`) {
-			out = plainValue(text, vs, ve, k, out)
+			out = plainValue(text, vs, ve, k, refNever, out) // JSON: nothing expands '$'
 			continue
 		}
 		var dec string
 		if json.Unmarshal([]byte(`"`+raw+`"`), &dec) != nil {
 			continue
 		}
-		if utf8.RuneCountInString(dec) < minLiteralLen || shapedValue(dec) || referenceValue(dec) {
+		if utf8.RuneCountInString(dec) < minLiteralLen || shapedValue(dec) {
 			continue
 		}
 		out = append(out, Span{Start: vs, End: ve, Kind: k, Value: dec, Encoding: EncJSONEscape})
@@ -1138,9 +1210,16 @@ func kvSecrets(text string, out []Span) []Span {
 		if !ok {
 			continue
 		}
+		// A pair after '?' or '&' is a URL query or form field, where '$'
+		// expands to nothing; any other pair is read as a shell or env
+		// assignment (DB_PASSWORD=$PASS, export JWT=$(cat f)).
+		ctx := refShell
+		if m[0] < m[2] && (text[m[0]] == '?' || text[m[0]] == '&') {
+			ctx = refNever
+		}
 		vs, ve := valueGroup(m, 2)
 		if vs != m[8] { // quoted: the inner string as written
-			out = quotedValue(text, vs, ve, k, out)
+			out = quotedValue(text, vs, ve, k, ctx, out)
 			continue
 		}
 		raw := text[vs:ve]
@@ -1148,16 +1227,17 @@ func kvSecrets(text string, out []Span) []Span {
 			continue // %DB_PASSWORD% is a template marker, not %DB-escaped
 		}
 		if !strings.ContainsAny(raw, "%+") {
-			out = plainValue(text, vs, ve, k, out)
+			out = plainValue(text, vs, ve, k, ctx, out)
 			continue
 		}
 		dec, err := url.QueryUnescape(raw)
 		if err != nil {
 			// Not valid percent-encoding (%Pa55w0rd%): the value is literal.
-			out = plainValue(text, vs, ve, k, out)
+			out = plainValue(text, vs, ve, k, ctx, out)
 			continue
 		}
-		if utf8.RuneCountInString(dec) < minLiteralLen || shapedValue(dec) || placeholderValue(dec) || referenceValue(dec) {
+		// Percent-encoded: a URL/form value (%24ummer2024), never a reference.
+		if utf8.RuneCountInString(dec) < minLiteralLen || shapedValue(dec) || placeholderValue(dec) {
 			continue
 		}
 		out = append(out, Span{Start: vs, End: ve, Kind: k, Value: dec, Encoding: EncURL})
@@ -1165,14 +1245,14 @@ func kvSecrets(text string, out []Span) []Span {
 	return out
 }
 
-// quotedValue reports a quoted field value; a token value that carries an
-// auth scheme ("Bearer x") is split like a header.
-func quotedValue(text string, s, e int, k Kind, out []Span) []Span {
+// quotedValue reports a quoted field value written in ctx; a token value
+// that carries an auth scheme ("Bearer x") is split like a header.
+func quotedValue(text string, s, e int, k Kind, ctx refContext, out []Span) []Span {
 	low := strings.ToLower(text[s:e])
 	if k == KindToken && (strings.HasPrefix(low, "bearer ") || strings.HasPrefix(low, "basic ")) {
-		return authValue(text, s, e, out)
+		return authValue(text, s, e, refNever, out) // an Authorization value
 	}
-	if sp, ok := valueSpan(text, s, e, k); ok {
+	if sp, ok := valueSpanIn(text, s, e, k, ctx); ok {
 		out = append(out, sp)
 	}
 	return out
@@ -1237,7 +1317,7 @@ func optionValue(text string, m []int, spaced bool, out []Span) []Span {
 		return out
 	}
 	v := text[vs:ve]
-	if envVarRE.MatchString(v) || strings.HasPrefix(v, "`") || strings.HasPrefix(v, "$(") || placeholderValue(v) {
+	if referenceValue(v, refShell) || placeholderValue(v) {
 		return out
 	}
 	if k == KindUsername && uidRE.MatchString(v) {
@@ -1246,7 +1326,7 @@ func optionValue(text string, m []int, spaced bool, out []Span) []Span {
 	if k == KindToken && strings.ContainsAny(v[:1], "/~.") {
 		return out // a path
 	}
-	if sp, ok := valueSpan(text, vs, ve, k); ok {
+	if sp, ok := valueSpanIn(text, vs, ve, k, refShell); ok {
 		out = append(out, sp)
 	}
 	return out
