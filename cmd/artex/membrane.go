@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -37,7 +38,13 @@ func runMembrane(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("membrane verify", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	task := fs.String("task", "", "task id to verify")
-	keyDir := fs.String("keys-dir", config.BaseDir(), "directory holding membrane.keys (the server's key dir) when the env keys are not set")
+	// Default: the server's key dir, ARTEX_JWT_KEY_DIR (/app/keys in Docker),
+	// else the install dir.
+	defKeyDir := strings.TrimSpace(os.Getenv("ARTEX_JWT_KEY_DIR"))
+	if defKeyDir == "" {
+		defKeyDir = config.BaseDir()
+	}
+	keyDir := fs.String("keys-dir", defKeyDir, "directory holding membrane.keys (the server's key dir) when the env keys are not set")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
 	}
