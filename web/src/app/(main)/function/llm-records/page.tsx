@@ -485,18 +485,35 @@ export default function LLMRecordsPage() {
               ) : (
                 <Badge variant="destructive" className="text-xs">Error</Badge>
               )}
-              {/* Raw view toggle. Old records have no raw data; disable it rather than silently
-                  falling back, to avoid looking like "raw matches parsed". */}
-              <Button
-                variant={showRaw ? "secondary" : "ghost"}
-                size="sm"
-                className="ml-auto h-7 shrink-0 text-xs"
-                disabled={!hasRaw}
-                title={hasRaw ? "View the raw HTTP actually exchanged with the provider" : "This record was captured before the feature launched; no raw data"}
-                onClick={() => setRawView((v) => !v)}
-              >
-                Raw
-              </Button>
+              {/* Operator / model view toggle (identity membrane, spec §12). Operator view = request_body /
+                  response_body: the normalized exchange with real values. Model view = raw_request / raw_response:
+                  the bytes actually exchanged with the provider — aliased when the profile is membraned.
+                  Old records have no raw data; the model view is disabled rather than silently falling back. */}
+              <div className="ml-auto flex shrink-0 items-center rounded-md border p-0.5">
+                <Button
+                  variant={showRaw ? "ghost" : "secondary"}
+                  size="sm"
+                  className="h-6 px-2 text-xs"
+                  title="Normalized request/response with real values, as the operator sees them"
+                  onClick={() => setRawView(false)}
+                >
+                  Operator view
+                </Button>
+                <Button
+                  variant={showRaw ? "secondary" : "ghost"}
+                  size="sm"
+                  className="h-6 px-2 text-xs"
+                  disabled={!hasRaw}
+                  title={
+                    hasRaw
+                      ? "Raw bytes actually sent to / received from the model provider (aliased when the membrane is on for this profile)"
+                      : "This record was captured before raw capture existed; no model-view data"
+                  }
+                  onClick={() => setRawView(true)}
+                >
+                  Model view
+                </Button>
+              </div>
               <Button
                 variant="ghost"
                 size="icon"
@@ -510,7 +527,7 @@ export default function LLMRecordsPage() {
             <div className="grid min-h-0 flex-1 grid-cols-2 divide-x">
               <div className="flex min-h-0 min-w-0 flex-col">
                 <div className="flex items-center gap-2 border-b py-0.5 pr-1.5 pl-3 text-[11px] font-medium text-muted-foreground">
-                  <span>Request{showRaw && " · raw"}</span>
+                  <span>Request{showRaw ? " · model view (bytes sent)" : " · operator view"}</span>
                   <CopyButton text={reqText || ""} />
                 </div>
                 <div className="min-h-0 flex-1 overflow-auto">
@@ -528,7 +545,7 @@ export default function LLMRecordsPage() {
               </div>
               <div className="flex min-h-0 min-w-0 flex-col">
                 <div className="flex items-center gap-2 border-b py-0.5 pr-1.5 pl-3 text-[11px] font-medium text-muted-foreground">
-                  <span>Response{showRaw && " · raw (SSE)"}</span>
+                  <span>Response{showRaw ? " · model view (raw bytes received)" : " · operator view"}</span>
                   <CopyButton text={respText || ""} />
                 </div>
                 <div className="min-h-0 flex-1 overflow-auto">

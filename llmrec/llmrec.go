@@ -357,8 +357,10 @@ func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, re
 		// Raw wire bodies; empty when the transport did not fill the Capture
 		// (e.g. a provider dialing through a client without the capture hook, or
 		// a call that failed before any HTTP request went out).
-		RawRequest:  capt.RawRequest(),
-		RawResponse: capt.RawResponse(),
+		RawRequest: capt.RawRequest(),
+		// Pairs this record with its membrane audit event (offline verify).
+		MembraneRequestSHA256: capt.MembraneHash(),
+		RawResponse:           capt.RawResponse(),
 	}
 
 	if err := r.pg.InsertLLMRecord(rec); err != nil {

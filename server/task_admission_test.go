@@ -612,6 +612,10 @@ func TestTaskLLMResolutionPrefersAgentBindingOverTaskChain(t *testing.T) {
 	}()
 
 	s := &Server{m: m, provByProfile: map[int64]*provEntry{}}
+	// The profiles use the default (remote) endpoint, so their providers need
+	// the identity membrane; without it they fail closed.
+	membraneTestKeys(t)
+	s.initMembrane(t.TempDir())
 	got, err := s.resolveTaskRoleLLM(task, "worker")
 	if err != nil {
 		t.Fatal(err)

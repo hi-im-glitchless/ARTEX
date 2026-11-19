@@ -82,7 +82,9 @@ func (s *Server) addTaskCredential(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	writeJSON(w, 201, taskCredentialDTO(c))
+	out := taskCredentialDTO(c)
+	membraneSeedResult(out, s.membraneSeedChanged(r.Context(), nil, id))
+	writeJSON(w, 201, out)
 }
 
 func (s *Server) deleteTaskCredential(w http.ResponseWriter, r *http.Request) {

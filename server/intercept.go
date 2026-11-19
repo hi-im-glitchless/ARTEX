@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
@@ -25,8 +26,12 @@ const judgeWorkerLane = "judge"
 
 // chatGuard returns a guard wired with the manager's interceptor, used for chat
 // conversations. Called once per applyLLM so a new LLM config always gets a fresh guard.
-func (s *Server) chatGuard() *guard.Guard {
-	return guard.NewWithInterceptor(s.m.interceptor)
+// prov/cfg are the chat agent's provider: they decide whether the membrane's
+// web_search rule applies (ruling R19).
+func (s *Server) chatGuard(prov llm.Provider, cfg agent.Config) *guard.Guard {
+	g := guard.NewWithInterceptor(s.m.interceptor)
+	g.SetMembraneCheck(s.membraneToolCheck("", "chat", func() bool { return providerMembraned(prov, cfg) }))
+	return g
 }
 
 // wireInterceptReviewer installs the LLM fallback judge into the interceptor. The

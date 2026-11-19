@@ -34,6 +34,7 @@ type MainAgent struct {
 	nonStreamingFn  func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn    func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn     func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
+	hooks           harness.HookRunner                     // tool hooks (membrane tool check); nil = none
 }
 
 // SetNoaEnabled wires a resolver deciding whether runs use the experimental noa
@@ -166,8 +167,9 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		// On by default; ARTEX_UNTRUSTED_BOUNDARY=0 opts out: nonce-frame tool output as untrusted data.
 		UntrustedOutputBoundary: untrustedBoundaryEnabled(),
 	}
-	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
-		opts.Hooks = hooks
+	// Membrane tool check first, then the task's target-only Guard.
+	if h := chainHooks(m.hooks, hooks); h != nil {
+		opts.Hooks = h
 	}
 	// Segment 0 keeps the legacy "exp%d-main" name so existing transcripts still
 	// load; each new session (seg>=1) gets its own file for a clean context. The id

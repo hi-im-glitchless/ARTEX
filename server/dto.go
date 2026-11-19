@@ -6,8 +6,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/norma/llm"
 )
 
 // DTO/serialization layer: each handler emits EXACTLY the frontend's spec shapes
@@ -641,6 +643,10 @@ type LLMProfileDTO struct {
 	// window). Per item attempts: 0=inherit the global policy | -1=disable that retry
 	// layer | >0=count; interval_ms: 0=default exponential backoff | >0=use that fixed millisecond interval. All zero = fully follow the global policy, i.e. the historical behavior.
 	Retry db.RetryOverride `json:"retry"`
+	// MembraneRequired is the identity-membrane host rule for base_url
+	// (agent.MembraneRequiredByHost, override not applied): true = remote,
+	// requests go through the membrane; false = trusted local endpoint.
+	MembraneRequired bool `json:"membrane_required"`
 }
 
 func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
@@ -667,6 +673,7 @@ func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 		SessionHeaderKey: p.SessionHeaderKey,
 		UserAgent:        p.UserAgent,
 		Retry:            p.Retry,
+		MembraneRequired: agent.MembraneRequiredByHost(agent.EffectiveBaseURL(llm.Format(p.Format), p.BaseURL)),
 	}
 }
 

@@ -48,6 +48,10 @@ func main() {
 }
 
 func run() int {
+	// Offline subcommand: `artex membrane verify --task <id>` (no server).
+	if len(os.Args) > 1 && os.Args[1] == "membrane" {
+		return runMembrane(os.Args[2:], os.Stdout, os.Stderr)
+	}
 	var (
 		addr    = flag.String("addr", "127.0.0.1:8787", "HTTP listen address")
 		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "runtime data directory: traffic index, task files, transcripts (default: data/ next to the executable)")

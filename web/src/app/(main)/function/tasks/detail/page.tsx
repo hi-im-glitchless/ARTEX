@@ -46,6 +46,7 @@ import { CredentialsTab } from "./_tabs/credentials-tab";
 import { FindingsTab } from "./_tabs/findings-tab";
 import { GraphTab } from "./_tabs/graph-tab";
 import { InterceptTab } from "./_tabs/intercept-tab";
+import { MembraneTab } from "./_tabs/membrane-tab";
 import { OverviewTab } from "./_tabs/overview-tab";
 import { ReportTab } from "./_tabs/report-tab";
 import { RetestsTab } from "./_tabs/retests-tab";
@@ -63,6 +64,7 @@ const TABS = [
   { value: "credentials", label: "Credentials" },
   { value: "coverage", label: "Asset coverage" },
   { value: "intercept", label: "Interception approval" },
+  { value: "membrane", label: "Membrane" },
   { value: "report", label: "Report" },
 ];
 
@@ -456,6 +458,9 @@ function TaskDetailInner() {
         </TabsContent>
         <TabsContent value="intercept" className="mt-0">
           <InterceptTab taskId={id} />
+        </TabsContent>
+        <TabsContent value="membrane" className="mt-0">
+          <MembraneTab key={id} taskId={id} />
         </TabsContent>
         <TabsContent value="report" className="mt-0">
           <ReportTab taskId={id} />

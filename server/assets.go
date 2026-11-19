@@ -139,6 +139,7 @@ func (s *Server) createCompany(w http.ResponseWriter, r *http.Request) {
 	if len(scopeErrs) > 0 {
 		out["scope_errors"] = scopeErrs
 	}
+	membraneSeedResult(out, s.membraneSeedChanged(r.Context(), []int64{id}, 0))
 	writeJSON(w, 201, out)
 }
 
@@ -237,6 +238,7 @@ func (s *Server) addCompanyScope(w http.ResponseWriter, r *http.Request) {
 	if warning, err := cs.MalformedIPAssetWarning(); err == nil && warning != "" {
 		out["warnings"] = []string{warning}
 	}
+	membraneSeedResult(out, s.membraneSeedChanged(r.Context(), []int64{id}, 0))
 	writeJSON(w, 200, out)
 }
 

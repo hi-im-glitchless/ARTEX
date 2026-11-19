@@ -27,9 +27,10 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import type { LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride } from "@/lib/types";
+import type { LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride, MembraneStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
+import { MembraneStatusLine, ProfileMembraneBadge } from "./_components/membrane";
 import { ProfileRetryFields, RetryPolicyPanel, ZERO_OVERRIDE } from "./_components/retry";
 import { setVisibleInterval } from "@/lib/polling";
 
@@ -904,6 +905,15 @@ export default function LLMPage() {
     void load();
   }, [load]);
 
+  // Identity membrane status: drives the global status line and the override state of the per-profile badge.
+  const [membrane, setMembrane] = React.useState<MembraneStatus | null>(null);
+  React.useEffect(() => {
+    api
+      .membraneStatus()
+      .then(setMembrane)
+      .catch(() => setMembrane(null));
+  }, []);
+
   // The health badge on each card reads pool state by profile id.
   const health = React.useMemo(() => {
     const m = new Map<string, LLMPoolMember>();
@@ -945,6 +955,9 @@ export default function LLMPage() {
           <p className="text-muted-foreground text-sm">
             Format / model / rate-limit settings shared by all agents. Click a card to edit it; the starred card is the active profile.
           </p>
+          <div className="mt-1.5">
+            <MembraneStatusLine status={membrane} />
+          </div>
         </div>
         <div className="flex items-center gap-2">
           <Button size="sm" variant="outline" onClick={() => setPoolOpen(true)}>
@@ -1003,6 +1016,7 @@ export default function LLMPage() {
                           <Badge variant="outline" className="uppercase">
                             {p.format}
                           </Badge>
+                          <ProfileMembraneBadge profile={p} status={membrane} />
                           <Badge variant="outline" className={cn("ml-auto", h.cls)} title={h.hint}>
                             {h.label}
                           </Badge>

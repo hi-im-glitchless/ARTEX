@@ -29,6 +29,19 @@ func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 	if !s.engine.beginTaskOperation(t.ID) {
 		return
 	}
+	// Seed the identity membrane before anything can reach an LLM (spec
+	// §7.1). Fail closed: a task whose scope or credentials cannot be loaded
+	// into the dictionary does not start.
+	if err := s.membraneSyncTask(t); err != nil {
+		log.Printf("[membrane] task %s not started: %v", t.ID, err)
+		s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "text",
+			Summary: "task not started: identity membrane seed sync failed (fail closed) — " + err.Error()})
+		if _, serr := s.m.SetTaskStatusGuarded(t.ID, "failed", ""); serr != nil {
+			log.Printf("[membrane] task %s: cannot mark failed: %v", t.ID, serr)
+		}
+		s.engine.decInflight(t.ID)
+		return
+	}
 	s.seed(t, seedText)
 	if seedFirstIntent {
 		s.seedFirstIntent(t)
@@ -388,7 +401,8 @@ func (s *Server) createGoals(ctx context.Context, t *Task, emit func(db.Activity
 	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	s.engine.BeginLLMCall(t.ID)
 	goalRuntime := s.agentsForTask(t).runtime
-	decomposed := agent.DecomposeGoalsWithProvider(ctx, goalRuntime, s.m.dir, t.Goal, t.Description, as, t.Store, taskID, goalRuntime.nonStreaming(), goalRuntime.maxTokens(), emit)
+	gctx := agent.WithToolHooks(ctx, s.membraneToolHooks(t.ID, "goals", goalRuntime.membraned))
+	decomposed := agent.DecomposeGoalsWithProvider(gctx, goalRuntime, s.m.dir, t.Goal, t.Description, as, t.Store, taskID, goalRuntime.nonStreaming(), goalRuntime.maxTokens(), emit)
 	s.engine.EndLLMCall(t.ID)
 	for _, g := range decomposed {
 		if strings.TrimSpace(g.Text) != "" {

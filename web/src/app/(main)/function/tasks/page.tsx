@@ -139,6 +139,8 @@ import type {
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
+import { MembranePreviewPanel } from "./_components/membrane-preview";
+
 // fmtBytes renders a human file size for the upload manifest.
 function fmtBytes(n: number): string {
   if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MB`;
@@ -3093,6 +3095,8 @@ function CreateTaskSheet({
   const [coverageEnabled, setCoverageEnabled] = React.useState(true); // asset coverage feature; on by default. Off = no coverage computed/displayed, no scope accumulation, scope-related tools hidden (company links unaffected)
   const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // task-level asset intercept rules (this task only, never entering the global table)
   const [credentials, setCredentials] = React.useState<TaskCredentialInput[]>([]); // test accounts declared at creation (#3); an empty password = the agent registers that account and records it
+  // Sensitive terms added from the membrane preview: saved as task-scope keyword rows at creation (before launch).
+  const [sensitiveTerms, setSensitiveTerms] = React.useState<string[]>([]);
   // Method 1, file upload: files are staged under drafts/<draftId>/uploads/ before the task is created, and their absolute paths are appended to the description.
   const [uploading, setUploading] = React.useState(false);
   const [uploadCount, setUploadCount] = React.useState(0);
@@ -3166,6 +3170,7 @@ function CreateTaskSheet({
         credentials: credentials
           .map((c) => ({ domain: c.domain.trim(), username: c.username.trim(), password: c.password, note: c.note?.trim() ?? "" }))
           .filter((c) => c.domain !== "" && c.username !== ""),
+        scopeKeywords: sensitiveTerms,
       });
       toast.success("Task created");
       setName("");
@@ -3182,6 +3187,7 @@ function CreateTaskSheet({
       setSeedFirstIntent(false);
       setCoverageEnabled(true);
       setInterceptRules([]);
+      setSensitiveTerms([]);
       setUploadCount(0);
       draftIdRef.current = "";
       setOpen(false);
@@ -3295,6 +3301,18 @@ function CreateTaskSheet({
                 onChange={(e) => setGoal(e.target.value)}
               />
             </div>
+            {/* Identity membrane: the description + goal as the remote model would see them (server-side dry run, debounced). */}
+            <MembranePreviewPanel
+              text={description.trim() || goal.trim() ? `${description.trim()}\n${goal.trim()}` : ""}
+              companyIds={companyIDs}
+              sensitiveTerms={sensitiveTerms}
+              onAddTerm={(term) =>
+                setSensitiveTerms((prev) =>
+                  prev.some((t) => t.toLowerCase() === term.toLowerCase()) ? prev : [...prev, term],
+                )
+              }
+              onRemoveTerm={(term) => setSensitiveTerms((prev) => prev.filter((t) => t !== term))}
+            />
             <Field>
               <FieldLabel htmlFor="source-tasks">Linked tasks</FieldLabel>
               <SourceTaskPicker

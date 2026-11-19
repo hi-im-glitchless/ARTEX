@@ -50,6 +50,12 @@ services:
       ARTEX_TASK_BUDGET_TURNS: ${ARTEX_TASK_BUDGET_TURNS:-}
       ARTEX_INTENT_BUDGET_TOKENS: ${ARTEX_INTENT_BUDGET_TOKENS:-}
       ARTEX_INTENT_BUDGET_TURNS: ${ARTEX_INTENT_BUDGET_TURNS:-}
+      # Identity membrane keys. Required in Docker: the generated key file would live in
+      # the container's writable layer (/app) and be lost on recreate, so ARTEX refuses
+      # to generate keys inside a container (remote LLM calls fail closed until set).
+      # Back them up.
+      ARTEX_MEMBRANE_KEY: ${ARTEX_MEMBRANE_KEY:-}
+      ARTEX_MEMBRANE_HMAC_KEY: ${ARTEX_MEMBRANE_HMAC_KEY:-}
     ports:
       - "${ARTEX_BIND_ADDR:-127.0.0.1}:8787:8787"
       - "127.0.0.1:8788:8788"

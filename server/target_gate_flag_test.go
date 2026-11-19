@@ -177,7 +177,7 @@ func TestCreateTaskAcceptsTargetGate(t *testing.T) {
 		if err != nil || stored == nil || stored.TargetGate != tc.want {
 			t.Fatalf("create %q: stored %+v, %v; want %v", tc.field, stored, err, tc.want)
 		}
-		if loaded := taskFromPG(stored, g.m.pg.Exploration(stored.ExplorationID), g.m.interceptor); loaded.targetScope(0).Enabled() != tc.want {
+		if loaded := taskFromPG(stored, g.m.pg.Exploration(stored.ExplorationID), g.m.interceptor, nil); loaded.targetScope(0).Enabled() != tc.want {
 			t.Fatalf("create %q: a task loaded from the database has the gate %v", tc.field, !tc.want)
 		}
 	}

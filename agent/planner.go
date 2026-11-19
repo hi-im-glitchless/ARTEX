@@ -40,6 +40,7 @@ type Planner struct {
 	noaEnabledFn      func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
 	compactor         *Compactor                             // cold-node compaction (§7); nil = disabled
+	hooks             harness.HookRunner                     // tool hooks (membrane tool check); nil = none
 	// lessonsBlock is the raw RSI evidence block. Empty = off. Plan() frames it
 	// with a per-run data envelope (field=lessons) and appends it after the
 	// rendered system prompt. The server renders the text from outcome records.
@@ -565,8 +566,9 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		// On by default; ARTEX_UNTRUSTED_BOUNDARY=0 opts out: nonce-frame tool output as untrusted data.
 		UntrustedOutputBoundary: untrustedBoundaryEnabled(),
 	}
-	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
-		opts.Hooks = hooks
+	// Membrane tool check first, then the task's target-only Guard.
+	if h := chainHooks(p.hooks, hooks); h != nil {
+		opts.Hooks = h
 	}
 	// The session id is the provider-side identity (session header, usage metering)
 	// with or without persistence; Norma only puts it on ctx when it writes a transcript.

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/llmrec"
+	"github.com/Autumn-27/artex/membrane"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
@@ -95,6 +96,19 @@ type Config struct {
 	// global policy → built-in default, resolved server-side). See RetryConfig for
 	// the per-layer semantics; zero values = fully inherit the built-in defaults.
 	Retry RetryConfig
+	// Membrane and MembraneAudit wrap every provider whose base URL is not a
+	// trusted local model (see MembraneRequired) in the identity membrane.
+	// When the membrane is required and either is nil, NewProvider fails
+	// closed with ErrMembraneNotInitialised. ProfileName is recorded in the
+	// membrane's audit events.
+	Membrane      *membrane.Engine
+	MembraneAudit membrane.Auditor
+	// MembraneSyncer, when set, seeds each task's scope, credentials and
+	// text before its requests (membrane.WithSyncer). It must stay
+	// comparable (applyLLM compares Configs with ==): the server sets it to
+	// its *Server pointer.
+	MembraneSyncer membrane.Syncer
+	ProfileName    string
 }
 
 // RetryConfig holds the retry parameters that travel with one LLM config. The
@@ -358,16 +372,35 @@ func (c Config) Provider() string {
 	return "anthropic"
 }
 
+// effectiveBaseURL is the endpoint the provider dials (EffectiveBaseURL).
+func (c Config) effectiveBaseURL() string { return EffectiveBaseURL(c.Format, c.BaseURL) }
+
+// EffectiveBaseURL is the endpoint a profile of this format dials: baseURL,
+// or for an Ollama profile without one, the local Ollama default. The
+// membrane decision and its UI badge both use it.
+func EffectiveBaseURL(format llm.Format, baseURL string) string {
+	if format == FormatOllama && strings.TrimSpace(baseURL) == "" {
+		return DefaultOllamaBaseURL
+	}
+	return baseURL
+}
+
+// MembraneRequired reports whether a provider built from c goes through the
+// identity membrane (MembraneRequired on the endpoint it actually dials).
+func (c Config) MembraneRequired() bool { return MembraneRequired(c.effectiveBaseURL()) }
+
 // NewProvider builds an llm.Provider from the config. When a rate is set, the
 // limiter lives on the single provider instance — so planner + all workers +
 // main agent (which share this provider) are bounded by one shared rate limit.
+//
+// Every provider whose base URL is not a trusted local model is wrapped in the
+// identity membrane (spec §5.1, §9.4). The wrap sits below llmrec and llmpool,
+// so llmrec's raw wire capture holds aliased bytes while its RequestBody stays
+// real. Without an engine and an auditor such a provider is not built at all
+// (fail closed).
 func (c Config) NewProvider() (llm.Provider, error) {
-	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey, c.UserAgent)
-	if err != nil {
-		return nil, err
-	}
 	wireFormat := c.Format
-	baseURL := c.BaseURL
+	baseURL := c.effectiveBaseURL()
 	apiKey := c.APIKey
 	// Ollama speaks OpenAI's Chat Completions on the wire. Bundle the keyless
 	// defaults here so an Ollama config can never leak toward the SDK's env-
@@ -376,12 +409,24 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	// that requires one carries a real key in the profile.
 	if wireFormat == FormatOllama {
 		wireFormat = llm.FormatOpenAI
-		if strings.TrimSpace(baseURL) == "" {
-			baseURL = DefaultOllamaBaseURL
-		}
 		if strings.TrimSpace(apiKey) == "" {
 			apiKey = ollamaPlaceholderKey
 		}
+	}
+	// The membrane decision uses the endpoint actually dialled (an Ollama
+	// profile without a base URL talks to the local default).
+	required := membraneRequiredFn(baseURL)
+	if required && (c.Membrane == nil || c.MembraneAudit == nil) {
+		return nil, ErrMembraneNotInitialised
+	}
+	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey, c.UserAgent)
+	if err != nil {
+		return nil, err
+	}
+	if !required {
+		// The membrane is skipped only because the endpoint is local; a 307/308
+		// would resend the real body to wherever it points.
+		client.CheckRedirect = refuseUntrustedRedirect
 	}
 	lc := llm.Config{
 		Format:     wireFormat,
@@ -408,7 +453,15 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	if c.RatePerSecond > 0 || c.RatePerMinute > 0 {
 		lc.RateLimit = &llm.RateLimit{PerSecond: c.RatePerSecond, PerMinute: c.RatePerMinute}
 	}
-	return llm.NewProvider(lc)
+	prov, err := llm.NewProvider(lc)
+	if err != nil || !required {
+		return prov, err
+	}
+	var opts []membrane.Option
+	if c.MembraneSyncer != nil {
+		opts = append(opts, membrane.WithSyncer(c.MembraneSyncer))
+	}
+	return membrane.Wrap(prov, c.Membrane, c.MembraneAudit, c.ProfileName, opts...), nil
 }
 
 // IsQuotaExhaustedMessage deliberately recognizes only explicit balance,

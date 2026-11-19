@@ -260,6 +260,10 @@ type Manager struct {
 	traffic     *traffic.Traffic       // process-wide recording proxy (may be nil)
 	enrich      *enrich.Engine         // engine-side asset auto-completion (DNS/HTTP)
 	interceptor *intercept.Interceptor // user-configured tool-call interception rules
+	// membraneCheckFor builds the identity membrane's tool check for a task's
+	// worker guard (spec §9.2/§9.3). Set by the server before tasks load; nil
+	// (or a nil result) = no membrane check.
+	membraneCheckFor func(taskID string) guard.MembraneCheck
 
 	// Capture-proxy rewrite rules: rewriteMu serializes reloads, rewriteSet is
 	// the snapshot last compiled, rewriteErrors outlives the reloads.
@@ -886,7 +890,11 @@ func unixNanoOrZero(t *time.Time) int64 {
 	return t.UnixNano()
 }
 
-func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor) *Task {
+func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor, mc func(taskID string) guard.MembraneCheck) *Task {
+	g := guard.NewWithInterceptor(ic)
+	if mc != nil {
+		g.SetMembraneCheck(mc(strconv.FormatInt(pt.ID, 10)))
+	}
 	t := &Task{
 		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
 		Name:       pt.Name,
@@ -905,7 +913,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		PlanQuietMode:   pt.PlanQuietMode,
 		CoverageEnabled: pt.CoverageEnabled,
 		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
-		Store: store, Guard: guard.NewWithInterceptor(ic), TargetGuard: guard.NewTargetOnly(ic), notify: make(chan struct{}, 1),
+		Store: store, Guard: g, TargetGuard: guard.NewTargetOnly(ic), notify: make(chan struct{}, 1),
 		interceptor: ic,
 	}
 	t.targetGate.Store(pt.TargetGate)
@@ -997,7 +1005,7 @@ func (m *Manager) CreateTaskWithOptions(description, goal string, opts pgdb.Task
 	if err != nil {
 		return nil, err
 	}
-	t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
+	t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor, m.membraneCheckFor)
 	m.mu.Lock()
 	m.tasks[t.ID] = t
 	m.active = t.ID
@@ -1196,7 +1204,7 @@ func (m *Manager) LoadExisting() []*Task {
 		if _, ok := m.tasks[id]; ok {
 			continue
 		}
-		t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
+		t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor, m.membraneCheckFor)
 		m.tasks[id] = t
 		loaded = append(loaded, t)
 	}

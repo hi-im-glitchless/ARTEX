@@ -24,6 +24,7 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/egress"
+	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
@@ -130,6 +131,8 @@ type Server struct {
 	archiveWake chan struct{}
 	archiveWG   sync.WaitGroup
 	side        *sideQuestionState
+
+	mem membraneState // identity membrane, built in New before any provider
 }
 
 // provEntry is a cached provider + its config for one LLM profile id.
@@ -170,6 +173,18 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		o(s)
 	}
 	s.initSetupToken()
+	s.initMembrane(keyDir) // before any provider is built
+	// Task worker guards get the membrane tool check (spec §9.2/§9.3); set
+	// before restoreTaskRuntimes loads the persisted tasks.
+	m.membraneCheckFor = func(taskID string) guard.MembraneCheck {
+		rt := &taskLLMRuntime{s: s, taskID: taskID, agentKey: "worker"}
+		return s.membraneToolCheck(taskID, "worker", rt.membraned)
+	}
+	// In the background: every task re-syncs before its requests anyway.
+	// Errors are logged and shown in membraneStatus.
+	if ctx.Err() == nil {
+		go func(ctx context.Context) { _ = s.membraneSyncAll(ctx) }(ctx)
+	}
 	s.initSideQuestions()
 	// Circuit-breaker thresholds/cooldowns are hot parameters on the failure path; push the global retry policy to the Registry once at startup,
 	// and again on every policy save (saveLLMRetryPolicy).
@@ -362,6 +377,7 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
 	s.applyProfileRetry(&cfg, p)
+	s.attachMembrane(&cfg, p.Name)
 	// Ollama profiles run keyless (local server); the other formats need a key.
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		return cfg, false
@@ -466,15 +482,16 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 		}
 	}
 	if prov == nil {
+		// Non-persisted/env configs do not have a profile cache key.
+		s.cfgMu.Lock()
+		profName := s.llmProf
+		s.cfgMu.Unlock()
+		s.attachMembrane(&cfg, profName)
 		var err error
 		prov, err = cfg.NewProvider()
 		if err != nil {
 			return err
 		}
-		// Non-persisted/env configs do not have a profile cache key.
-		s.cfgMu.Lock()
-		profName := s.llmProf
-		s.cfgMu.Unlock()
 		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, profName, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
 		prov = bindSideProvider(prov, cfg, 0, profName)
 	}
@@ -503,7 +520,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	s.chatAgent = agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win) // chat page runner
 	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	s.chatAgent.SetWebSearch(s.m.WebSearchOpts())
-	s.chatAgent.SetGuard(s.chatGuard())
+	s.chatAgent.SetGuard(s.chatGuard(prov, cfg))
 	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
 	s.chatAgent.SetMaxTokens(maxTokensResolver(cfg))
 	s.chatAgent.SetNoaEnabled(s.m.NoaCompactionEnabled) // experimental: noa context compaction (read per run)
@@ -538,6 +555,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
 	s.applyProfileRetry(&cfg, p)
+	s.attachMembrane(&cfg, p.Name)
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		return cfg, false
 	}
@@ -646,7 +664,7 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
 	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	ca.SetWebSearch(s.m.WebSearchOpts())
-	ca.SetGuard(s.chatGuard())
+	ca.SetGuard(s.chatGuard(s.poolForBinding(id, prov, cfg), cfg))
 	ca.SetNonStreaming(nonStreamingResolver(cfg))
 	ca.SetMaxTokens(maxTokensResolver(cfg))
 	ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // experimental: noa context compaction (read per run)
@@ -740,6 +758,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tasks/{id}/assets", s.attachTaskAssets)
 	mux.HandleFunc("DELETE /api/tasks/{id}/assets/{assetID}", s.detachTaskAsset)
 	mux.HandleFunc("GET /api/tasks/{id}/intent-assets", s.taskIntentAssets)
+	// identity membrane: status, preview, task events/verify/evidence,
+	// company key destruction (server/membrane_api.go)
+	s.registerMembraneRoutes(mux)
 
 	// workspace file manager (over workDir)
 	mux.HandleFunc("GET /api/workspace/list", s.wsList)
@@ -1423,6 +1444,7 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Validate provider construction before persisting it as the active profile.
+	s.attachMembrane(&cfg, "")
 	if _, err := cfg.NewProvider(); err != nil {
 		writeErr(w, 400, "provider init failed: "+err.Error())
 		return
@@ -1581,6 +1603,11 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// Retry params do [not] go into the connection test: the test has a 30s hard timeout, and stacking the configured retry counts/long intervals on top
 	// would only turn a perfectly usable endpoint into a "timeout failure". The test asks "does this endpoint work at all"; retry pacing
 	// is a runtime concern.
+	testProfile := ""
+	if stored != nil {
+		testProfile = stored.Name
+	}
+	s.attachMembrane(&cfg, testProfile) // the connection test goes through the membrane too
 	lat, reply, err := agent.TestConnection(r.Context(), cfg)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
@@ -1635,6 +1662,10 @@ type createTaskReq struct {
 	// Credentials: test accounts declared at creation (#3). An empty password means
 	// "agent generates": the agent registers that account and records it back.
 	Credentials []taskCredentialReq `json:"credentials,omitempty"`
+	// ScopeKeywords: task-scope keyword rows declared at creation (the
+	// membrane preview's "Add as sensitive term"). They land before the task
+	// launches, so the first request already aliases them.
+	ScopeKeywords []string `json:"scope_keywords,omitempty"`
 }
 
 type taskCredentialReq struct {
@@ -1697,6 +1728,17 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid task-level intercept rules: "+err.Error())
 		return
 	}
+	// Scope keywords are checked before the task row exists, so a bad list
+	// never leaves a task without its sensitive terms.
+	scopeKeywords, err := validateScopeKeywords(req.ScopeKeywords)
+	if err != nil {
+		writeErr(w, 400, "invalid scope keywords: "+err.Error())
+		return
+	}
+	if len(scopeKeywords) > 0 && s.m.Assets() == nil {
+		writeErr(w, 503, "asset store not enabled: scope keywords cannot be recorded")
+		return
+	}
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
 		Name: strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
@@ -1733,10 +1775,46 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if len(scopeKeywords) > 0 {
+		taskNum, _ := strconv.ParseInt(t.ID, 10, 64)
+		as := s.m.Assets()
+		for _, k := range scopeKeywords {
+			if _, err := as.AddAgentScope(taskNum, "keyword", k, "sensitive term (membrane preview)", "manual"); err != nil {
+				writeErr(w, 400, "invalid scope keyword: "+err.Error())
+				return
+			}
+		}
+	}
 	// Shared post-create flow (seed + seed intent + background goal decomposition + engine.Run), reusing the same launchTask as spawn_task.
 	// launchTask is async internally and never blocks the UI — goal decomposition visibly proceeds in the background.
 	s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
 	writeJSON(w, 201, taskDTO(t, s.resolvedTaskStatus(t)))
+}
+
+// Bounds of createTask's scope_keywords.
+const (
+	maxScopeKeywords   = 50
+	maxScopeKeywordLen = 256
+)
+
+// validateScopeKeywords returns the non-blank keywords, trimmed, or an
+// error naming the bound exceeded (never the value).
+func validateScopeKeywords(in []string) ([]string, error) {
+	var out []string
+	for _, k := range in {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		if len(k) > maxScopeKeywordLen {
+			return nil, fmt.Errorf("a keyword is longer than %d bytes", maxScopeKeywordLen)
+		}
+		out = append(out, k)
+	}
+	if len(out) > maxScopeKeywords {
+		return nil, fmt.Errorf("at most %d keywords", maxScopeKeywords)
+	}
+	return out, nil
 }
 
 func (s *Server) validateTaskProfileIDs(ids []int64) error {
@@ -2088,6 +2166,9 @@ func (s *Server) taskScopeAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	// A seed failure is logged; the task's next request fails closed on
+	// its own sync.
+	_ = s.membraneSeedChanged(r.Context(), nil, taskID)
 	writeJSON(w, 200, ts)
 }
 

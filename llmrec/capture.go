@@ -30,6 +30,33 @@ type Capture struct {
 	mu       sync.Mutex
 	request  string
 	attempts []*attempt
+	// membraneHash is the identity membrane's canonical request hash for
+	// this call, set by the membrane decorator before forwarding.
+	membraneHash string
+}
+
+// SetMembraneHash stores the membrane's canonical request hash (the
+// request_sha256 of the call's audit event). Only the first is kept, like
+// SetRequest: the raw request recorded is the first attempt's.
+func (c *Capture) SetMembraneHash(h string) {
+	if c == nil || h == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.membraneHash == "" {
+		c.membraneHash = h
+	}
+}
+
+// MembraneHash returns the hash SetMembraneHash stored ("" if none).
+func (c *Capture) MembraneHash() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.membraneHash
 }
 
 type attempt struct {
