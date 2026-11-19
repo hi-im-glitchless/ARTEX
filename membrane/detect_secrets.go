@@ -52,6 +52,12 @@ func dropNoise(spans []Span) []Span {
 	return out
 }
 
+// wordIDRE matches a word-number identifier (conv-164, task_12).
+var wordIDRE = regexp.MustCompile(`^[A-Za-z]+[-_][0-9]{1,6}$`)
+
+// jsonEscapeRE matches a JSON string escape inside a value.
+var jsonEscapeRE = regexp.MustCompile(`\\(?:u[0-9a-fA-F]{4}|[nrt"])`)
+
 // writeOutRE: a value made only of curl --write-out variables and separators
 // (%{http_code}, %{http_code}:%{size_download}).
 var writeOutRE = regexp.MustCompile(`^(?:%\{[A-Za-z_][A-Za-z0-9_.]*\}[^A-Za-z0-9%{}]*)+$`)
@@ -67,7 +73,10 @@ var writeOutRE = regexp.MustCompile(`^(?:%\{[A-Za-z_][A-Za-z0-9_.]*\}[^A-Za-z0-9
 //     credentials without brackets (usr=!!!) stay secrets;
 //   - a short number: below 4 digits for any credential, below 6 digits
 //     for a username. Status codes, sizes and counts printed after a label
-//     look like that; a real numeric password of 4+ digits (PIN) is kept.
+//     look like that; a real numeric password of 4+ digits (PIN) is kept;
+//   - a value carrying a JSON escape (read from escaped text);
+//   - for a token: a sentence, a backtick, an upper-case $NAME, or a
+//     word-number id (conv-164).
 func noiseValue(k Kind, v string) bool {
 	t := strings.TrimSpace(v)
 	core := strings.TrimRight(t, `\`)
@@ -79,6 +88,25 @@ func noiseValue(k Kind, v string) bool {
 	}
 	if core != t && placeholderValue(core) {
 		return true
+	}
+	// A value carrying a JSON escape (<unsigned>, 1\n\n) was read
+	// from escaped text at the wrong layer: the decoded text is what the
+	// value is, and the JSON-aware pass reads that one.
+	if jsonEscapeRE.MatchString(core) {
+		return true
+	}
+	// Not tokens, all enrolled as tokens in the live run: a sentence after a
+	// "Token:" label ("POST /rest/user/login with ..."), a shell variable
+	// reference ("$TOKEN"), a backtick-quoted code word
+	// ("nftMintChallenge`"), and a word-number id ("conv-164", an ARTEX
+	// conversation id).
+	if k == KindToken {
+		if len(strings.Fields(core)) > 4 || strings.ContainsRune(core, '`') || wordIDRE.MatchString(core) {
+			return true
+		}
+		if envVarRE.MatchString(core) && upperEnvName(core[1:]) {
+			return true
+		}
 	}
 	if k == KindUsername && strings.ContainsAny(core, "[](){}") {
 		alnum := 0
@@ -957,6 +985,9 @@ func secretFormats(text, low string, out []Span) []Span {
 	for _, m := range lineMatches(secretKVRE, text, func(s, e int) bool {
 		return strings.IndexByte(text[s:e], ':') >= 0 && pre(s, e)
 	}) {
+		if inURLPath(text, m[2]) {
+			continue // "/rest/user/change-password: PUT/POST?": an endpoint, not a label
+		}
 		k := KindToken
 		if passwordKeyRE.MatchString(text[m[2]:m[3]]) {
 			k = KindPassword
@@ -982,6 +1013,21 @@ func secretFormats(text, low string, out []Span) []Span {
 		}
 	}
 	return out
+}
+
+// inURLPath reports that the word starting at i is the last segment of a
+// URL path: the [A-Za-z0-9_-] run it ends is preceded by "/"
+// (/rest/user/change-password), not a label like "admin-password".
+func inURLPath(text string, i int) bool {
+	j := i
+	for j > 0 {
+		c := text[j-1]
+		if !(isASCIIAlnum(c) || c == '_' || c == '-') {
+			break
+		}
+		j--
+	}
+	return j > 0 && text[j-1] == '/'
 }
 
 // credPairRE: a user and a password written together in free text, as an

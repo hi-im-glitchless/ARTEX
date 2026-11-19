@@ -3,6 +3,7 @@ package membrane
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"regexp"
@@ -221,9 +222,20 @@ func (e *Engine) transformPass(text string, prov Provenance, assistant bool) (st
 	prot := e.mintedOccurrences(text)
 	var spans []Span
 	for _, sp := range e.p.Detect(text) {
-		if !insideAny(prot, sp.Start, sp.End) {
-			spans = append(spans, sp)
+		if insideAny(prot, sp.Start, sp.End) {
+			continue
 		}
+		// Assistant text and thinking never enrol a credential (ruling R12,
+		// extended): the model only sees aliases, so a password or username
+		// it writes is one it made up, a public default, or a word of code
+		// it reasons about ("password: currentPassword"). Enrolled ones are
+		// still replaced.
+		if assistant && isCredentialKind(sp.Kind) {
+			if _, _, ok := e.s.AliasFor(sp.Value); !ok {
+				continue
+			}
+		}
+		spans = append(spans, sp)
 	}
 	// ranges: output ranges that exposedOriginals must not touch; written
 	// marks a replacement, the others are kept detections and minted aliases.
@@ -634,6 +646,13 @@ func (e *Engine) enrolledLookalike(text string, sh shape) (start, end int, kind 
 		if _, _, ok := e.s.OriginalFor(v); ok {
 			return 0, 0, "", false
 		}
+		// The local part of a minted email alias (user-b3f6@541650.example)
+		// is alias space even when the same token was also enrolled as a
+		// real value (the model reused the alias as a login and the target
+		// echoed it): the email alias is what the model was given.
+		if e.inMintedEmail(text, sh) {
+			return 0, 0, "", false
+		}
 	}
 	if _, _, ok := e.s.OriginalFor(v); ok {
 		return 0, 0, "", false
@@ -745,6 +764,16 @@ func (e *Engine) inMintedEmail(text string, sh shape) bool {
 	return ok
 }
 
+// mintedEmailLocal reports that t[s:end] is the local part of a minted
+// email alias: followed by "@host" and local@host resolves. The dictionary
+// accepts an original right after an escape ("\nuser-ec31@juice-sh.op" in
+// a JSON string) where the reverse dictionary and the shape scanner see a
+// letter and miss the whole alias; this check does not depend on the left
+// boundary.
+func (e *Engine) mintedEmailLocal(t string, s, end int) bool {
+	return byteAfter(t, end) == '@' && e.inMintedEmail(t, shape{Start: s, End: end, text: t[s:end]})
+}
+
 // LeakCheck scans serialised (raw, and its URL, JSON-escape and HTML-entity
 // decoded views) for any enrolled original: the dictionary of originals,
 // plus enrolled public IP addresses (which the dictionary leaves to the
@@ -760,6 +789,75 @@ func (e *Engine) inMintedEmail(text string, sh shape) bool {
 // original or alias does, the body is scanned whole.
 func (e *Engine) LeakCheck(serialised []byte) []LeakHit {
 	text := string(serialised)
+	hits := e.leakCheckSegmented(text)
+	keep, _ := dropToolCredentialHits(text, hits, nil)
+	return keep
+}
+
+// dropToolCredentialHits removes credential hits (password, username,
+// token) that lie inside the request's top-level tool definitions ("Tools"
+// in the canonical body, "tools" on the wire). Tool definitions are
+// ARTEX's own constants, sent unchanged with every request: a credential
+// original that matches a word there ("current", "hash") is host
+// vocabulary, not client data, and blocking on it would block every
+// request of the task. Client names (domain, org, email, address) in a
+// tool definition still count. firsts, when not nil, is filtered alongside.
+func dropToolCredentialHits(text string, hits []LeakHit, firsts []time.Time) ([]LeakHit, []time.Time) {
+	cred := false
+	for _, h := range hits {
+		if isCredentialKind(h.Kind) {
+			cred = true
+			break
+		}
+	}
+	if !cred {
+		return hits, firsts
+	}
+	s, end, ok := toolsRange(text)
+	if !ok {
+		return hits, firsts
+	}
+	var kh []LeakHit
+	var kf []time.Time
+	for i, h := range hits {
+		if isCredentialKind(h.Kind) && s <= h.Offset && h.Offset < end {
+			continue
+		}
+		kh = append(kh, h)
+		if firsts != nil {
+			kf = append(kf, firsts[i])
+		}
+	}
+	return kh, kf
+}
+
+// toolsRange returns the byte range of the value of the top-level "tools"
+// (any case) member of a JSON object body.
+func toolsRange(text string) (int, int, bool) {
+	dec := json.NewDecoder(strings.NewReader(text))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return 0, 0, false
+	}
+	for dec.More() {
+		t, err := dec.Token()
+		if err != nil {
+			return 0, 0, false
+		}
+		key, _ := t.(string)
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return 0, 0, false
+		}
+		if strings.EqualFold(key, "tools") {
+			end := int(dec.InputOffset())
+			return end - len(raw), end, true
+		}
+	}
+	return 0, 0, false
+}
+
+// leakCheckSegmented is LeakCheck before the tool-definition filter.
+func (e *Engine) leakCheckSegmented(text string) []LeakHit {
 	cuts := leakCuts(text)
 	if len(cuts) == 0 || e.s.Dictionary().seam || e.s.ReverseDictionary().seam {
 		return e.leakSegment(text)
@@ -869,6 +967,9 @@ func (e *Engine) leakScan(text string) ([]LeakHit, []time.Time) {
 			}
 			if envelopeNumber(t, m.Start, m.End) {
 				continue // a request setting (max_tokens), not content
+			}
+			if e.mintedEmailLocal(t, m.Start, m.End) {
+				continue // local part of an email alias the store minted
 			}
 			add(m.Kind, toRaw(m.Start), m.Original)
 		}

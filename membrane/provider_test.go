@@ -322,11 +322,19 @@ func (stubEngine) ToModelRequest(req llm.CompletionRequest, _ Provenance) (llm.C
 	return req, newReport(), nil
 }
 
+// noScrubEngine also cannot repair the request (an original only the leak
+// check's decoded views see): the request must block.
+type noScrubEngine struct{ stubEngine }
+
+func (noScrubEngine) ScrubRequest(req llm.CompletionRequest) (llm.CompletionRequest, int) {
+	return req, 0
+}
+
 func TestLeakBlocked(t *testing.T) {
 	e, _ := newTestEngine(t)
 	f := &fakeProvider{}
 	aud := &memAuditor{}
-	p := wrap(f, stubEngine{e}, aud, "kimi")
+	p := wrap(f, noScrubEngine{stubEngine{e}}, aud, "kimi")
 	_, _, _, err := p.Complete(testCtx(), userReq("scan acmebank.pt"))
 	if !errors.Is(err, ErrLeakBlocked) {
 		t.Fatalf("want ErrLeakBlocked, got %v", err)

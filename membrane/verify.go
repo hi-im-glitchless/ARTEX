@@ -148,6 +148,7 @@ func (r *VerifyResult) add(e *Engine, records []VerifyRecord) {
 		}
 		r.Checked++
 		hits, firsts := e.leakScan(rec.Raw)
+		hits, firsts = dropToolCredentialHits(rec.Raw, hits, firsts)
 		if len(hits) == 0 {
 			continue
 		}

@@ -104,6 +104,7 @@ const globalSyncKey = ""
 type engineAPI interface {
 	ToModelRequest(req llm.CompletionRequest, prov Provenance) (llm.CompletionRequest, Report, error)
 	LeakCheck(serialised []byte) []LeakHit
+	ScrubRequest(req llm.CompletionRequest) (llm.CompletionRequest, int)
 	ToReal(text string) (string, []string)
 	ToRealJSON(raw json.RawMessage) (json.RawMessage, []string)
 	ToRealMessage(m llm.Message) (llm.Message, []string)
@@ -306,6 +307,19 @@ func (w *wrapped) prepare(ctx context.Context, req llm.CompletionRequest) (llm.C
 				return llm.CompletionRequest{}, m, block("serialise failed", errors.New("membrane: request not sent: cannot serialise request"))
 			}
 			hits = w.e.LeakCheck(body)
+		}
+	}
+	if len(hits) > 0 {
+		// The transform kept an enrolled original the leak check finds:
+		// replace it with its alias rather than block every retry of the
+		// same history. Whatever is still found blocks.
+		if scrubbed, n := w.e.ScrubRequest(out); n > 0 {
+			sb, err := json.Marshal(scrubbed)
+			if err != nil {
+				return llm.CompletionRequest{}, m, block("serialise failed", errors.New("membrane: request not sent: cannot serialise request"))
+			}
+			out, body, hits = scrubbed, sb, w.e.LeakCheck(sb)
+			rep.Flags = unionSorted(rep.Flags, []string{"leak_scrubbed"})
 		}
 	}
 	ev.Report = rep
