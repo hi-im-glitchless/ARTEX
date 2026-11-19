@@ -201,3 +201,39 @@ func TestTokenNoiseValues(t *testing.T) {
 		}
 	}
 }
+
+// A seeded org name that is a common word ("fusion", a client's product)
+// matched inside "confusion" in ARTEX's own skill descriptions, which reach
+// the model unchanged in the main agent's tool definitions: every main
+// agent request was blocked. A keyword does not continue a word on its
+// left; glued on the right (fusionbank) or at a camelCase start
+// (getFusion) it still matches.
+func TestKeywordDoesNotMatchInsideWord(t *testing.T) {
+	e, s := newTestEngine(t)
+	if _, err := s.seedEnroll(KindOrg, "fusion", seedProv); err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range []string{"key confusion and type confusion", "diffusion", "transfusion of data"} {
+		if hits := e.LeakCheck([]byte(in)); len(hits) != 0 {
+			t.Errorf("%q flagged: %v", in, hits)
+		}
+		out, _, err := e.ToModel(in, Provenance{TaskIDs: []int64{9}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != in {
+			t.Errorf("ToModel(%q) = %q", in, out)
+		}
+	}
+	for _, in := range []string{"Fusion portal", "fusionbank login", "getFusion()", "acme-fusion.pt"} {
+		if hits := e.LeakCheck([]byte(in)); len(hits) == 0 {
+			t.Errorf("%q not flagged", in)
+		}
+	}
+	req := llm.CompletionRequest{Messages: []llm.Message{llm.UserText("hi")},
+		Tools: []llm.ToolSchema{{Name: "skill", Description: "rate-limit trust confusion"}}}
+	body, _ := json.Marshal(req)
+	if hits := e.LeakCheck(body); len(hits) != 0 {
+		t.Errorf("tool definition flagged: %v", hits)
+	}
+}

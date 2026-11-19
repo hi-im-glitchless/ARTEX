@@ -1130,6 +1130,8 @@ func patternBound(k Kind, text string) boundMode {
 	switch {
 	case isKeywordKind(k) && utf8.RuneCountInString(text) <= shortKeywordMax:
 		return boundToken
+	case isKeywordKind(k):
+		return boundKeywordLeft
 	case k == KindDomain:
 		return boundHost
 	case k == KindEmail:

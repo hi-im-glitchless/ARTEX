@@ -58,6 +58,11 @@ const (
 	// boundLetters: no letter on either side (an all-letter value: bob is
 	// not inside bobby, but is in bob123).
 	boundLetters
+	// boundKeywordLeft: a long keyword (org, product, person) does not
+	// continue a word on its left (fusion is not in confusion), except at a
+	// camelCase start (getFusion); glued on the right it matches
+	// (fusionbank, robinhoodapp).
+	boundKeywordLeft
 )
 
 // isAlnumRune reports whether r is a letter or digit (any script).
@@ -82,6 +87,17 @@ func atBoundary(text string, start, end int, mode boundMode) bool {
 		left, right = unicode.IsDigit, unicode.IsDigit
 	case boundLetters:
 		left, right = unicode.IsLetter, unicode.IsLetter
+	}
+	if mode == boundKeywordLeft {
+		if start == 0 {
+			return true
+		}
+		r, _ := utf8.DecodeLastRuneInString(text[:start])
+		if !unicode.IsLetter(r) {
+			return true
+		}
+		f, _ := utf8.DecodeRuneInString(text[start:])
+		return unicode.IsLower(r) && unicode.IsUpper(f)
 	}
 	if mode == boundDigits && inDottedNumber(text, start, end) {
 		return false
