@@ -27,6 +27,7 @@ func TestMembraneRefusesGeneratedKeysInContainer(t *testing.T) {
 	t.Cleanup(func() { inContainer = old })
 	t.Setenv(membrane.EnvEncKey, "")
 	t.Setenv(membrane.EnvHMACKey, "")
+	t.Setenv("ARTEX_JWT_KEY_DIR", "")
 	keyDir := t.TempDir()
 	s := &Server{m: m}
 	s.initMembrane(keyDir)
@@ -36,6 +37,33 @@ func TestMembraneRefusesGeneratedKeysInContainer(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(keyDir, membrane.KeysFileName)); !os.IsNotExist(err) {
 		t.Fatalf("a key file was generated in a container: %v", err)
+	}
+}
+
+// Port: the shipped compose file mounts ./keys at ARTEX_JWT_KEY_DIR, a
+// persistent volume. With that explicit key directory the container rule
+// does not refuse (other rules, such as existing entries, still apply).
+func TestMembraneContainerWithExplicitKeyDirNotRefused(t *testing.T) {
+	t.Setenv("ARTEX_MEMBRANE", "")
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { m.Close() })
+	if m.pg == nil {
+		t.Skip("no postgres for this run")
+	}
+	old := inContainer
+	inContainer = func() bool { return true }
+	t.Cleanup(func() { inContainer = old })
+	t.Setenv(membrane.EnvEncKey, "")
+	t.Setenv(membrane.EnvHMACKey, "")
+	keyDir := t.TempDir()
+	t.Setenv("ARTEX_JWT_KEY_DIR", keyDir)
+	s := &Server{m: m}
+	s.initMembrane(keyDir)
+	if got := s.membraneStatus(); strings.Contains(got.Error, "container") {
+		t.Fatalf("status = %+v, want no container refusal with an explicit key directory", got)
 	}
 }
 

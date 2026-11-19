@@ -18,11 +18,15 @@ services:
     # Built from this checkout. The previous reference was a third-party
     # namespace whose repository is gone: whoever controls that name could
     # publish the tag this file would pull.
+    # `docker compose up -d --build` compiles the web UI and the Go binary
+    # (with the identity membrane) from this checkout; the image is tagged
+    # locally, nothing is pulled for this service.
     build:
       context: .
+      dockerfile: Dockerfile
       args:
         ARTEX_VERSION: ${ARTEX_VERSION:-dev}
-    image: artex:local
+    image: artex-membrane:local
     depends_on:
       postgres:
         condition: service_healthy
@@ -50,10 +54,10 @@ services:
       ARTEX_TASK_BUDGET_TURNS: ${ARTEX_TASK_BUDGET_TURNS:-}
       ARTEX_INTENT_BUDGET_TOKENS: ${ARTEX_INTENT_BUDGET_TOKENS:-}
       ARTEX_INTENT_BUDGET_TURNS: ${ARTEX_INTENT_BUDGET_TURNS:-}
-      # Identity membrane keys. Required in Docker: the generated key file would live in
-      # the container's writable layer (/app) and be lost on recreate, so ARTEX refuses
-      # to generate keys inside a container (remote LLM calls fail closed until set).
-      # Back them up.
+      # Identity membrane keys (base64, 32 bytes each: openssl rand -base64 32). Empty =
+      # ARTEX generates keys/membrane.keys in the ./keys volume (ARTEX_JWT_KEY_DIR) on first
+      # start. Without these and without that volume, remote LLM calls fail closed. Back
+      # them up: the stored client mapping cannot be decrypted without them.
       ARTEX_MEMBRANE_KEY: ${ARTEX_MEMBRANE_KEY:-}
       ARTEX_MEMBRANE_HMAC_KEY: ${ARTEX_MEMBRANE_HMAC_KEY:-}
     ports:

@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 
 	"github.com/Autumn-27/artex/agent"
@@ -120,13 +121,15 @@ func (s *Server) initMembrane(keyDir string) {
 	// Generating fresh keys over rows encrypted with other keys would leave
 	// the membrane permanently unable to open (for example a Docker container
 	// recreated without its key file). Refuse, and say what to restore.
-	if !membrane.KeysConfigured(keyDir) && inContainer() {
+	if !membrane.KeysConfigured(keyDir) && inContainer() && !explicitKeyDir() {
 		// A container's install directory is not a volume: a generated key
 		// file disappears when the container is recreated, and with it the
-		// ability to read the mapping table. Never generate there.
+		// ability to read the mapping table. Generate only into an explicit
+		// key directory (ARTEX_JWT_KEY_DIR, which the shipped compose file
+		// mounts as ./keys, next to jwt.key and secret.key).
 		fail("running in a container without " + membrane.EnvEncKey + "/" + membrane.EnvHMACKey +
-			": refusing to generate membrane keys that would be lost when the container is recreated — set both in .env " +
-			"(each: openssl rand -base64 32) and restart")
+			" or ARTEX_JWT_KEY_DIR: refusing to generate membrane keys that would be lost when the container is recreated — set both in .env " +
+			"(each: openssl rand -base64 32), or mount a key directory and set ARTEX_JWT_KEY_DIR, and restart")
 		return
 	}
 	if !membrane.KeysConfigured(keyDir) {
@@ -164,6 +167,11 @@ func (s *Server) initMembrane(keyDir string) {
 	st.engine = membrane.NewEngine(store, nil)
 	log.Printf("[membrane] enabled: %d entries, keys from %s", store.Len(), src)
 }
+
+// explicitKeyDir reports whether the key directory was set explicitly
+// (ARTEX_JWT_KEY_DIR). Inside a container that is the persistent key volume
+// the compose file mounts; the install directory is not.
+func explicitKeyDir() bool { return strings.TrimSpace(os.Getenv("ARTEX_JWT_KEY_DIR")) != "" }
 
 // inContainer reports whether ARTEX runs in a Docker or Podman container
 // (test seam).
