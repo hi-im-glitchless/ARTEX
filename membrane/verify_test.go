@@ -54,6 +54,68 @@ func jsonString(s string) string {
 	return string(b)
 }
 
+// Live task 16: a value enrolled after a request was sent failed every
+// earlier request. It is a disclosure before the membrane knew the value,
+// reported apart from misses (values known at send time).
+func TestVerifyLearnedLaterIsNotAMiss(t *testing.T) {
+	e, _ := newTestEngine(t) // fixture originals enrolled now
+	now := time.Now()
+	raw := `{"messages":[{"content":"login jsilva"}]}`
+	got := Verify(e, []VerifyRecord{
+		{ID: 1, Raw: raw, At: now.Add(-time.Hour)}, // sent before jsilva was enrolled
+		{ID: 2, Raw: raw, At: now.Add(time.Hour)},  // sent after: a miss
+		{ID: 3, Raw: raw},                          // send time unknown: a miss
+	})
+	if got.Failed != 2 || !slices.Equal(got.FailedIDs, []int64{2, 3}) || got.FailedKinds["username"] != 2 {
+		t.Fatalf("misses = %d %v %v, want 2 [2 3] username:2", got.Failed, got.FailedIDs, got.FailedKinds)
+	}
+	if got.LearnedLater != 1 || !slices.Equal(got.LearnedLaterIDs, []int64{1}) || got.LearnedLaterKinds["username"] != 1 {
+		t.Fatalf("learned later = %d %v %v, want 1 [1] username:1", got.LearnedLater, got.LearnedLaterIDs, got.LearnedLaterKinds)
+	}
+}
+
+type fakeVerifySource struct {
+	evs  []db.MembraneEvent
+	recs []db.LLMRawRequest
+}
+
+func (f fakeVerifySource) MembraneTaskEvents(string) ([]db.MembraneEvent, error) { return f.evs, nil }
+func (f fakeVerifySource) VerifyMembraneChain() (bool, int64, error)             { return true, 0, nil }
+func (f fakeVerifySource) LLMRawRequests(_ string, after int64, _ int) ([]db.LLMRawRequest, error) {
+	var out []db.LLMRawRequest
+	for _, r := range f.recs {
+		if r.ID > after {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+// VerifyTask takes each record's send time from the audit event it pairs
+// with; a task whose only hits were learned later passes, with a reason.
+func TestVerifyTaskPairsSendTimes(t *testing.T) {
+	e, _ := newTestEngine(t)
+	now := time.Now()
+	raw := `{"messages":[{"content":"login jsilva"}]}`
+	src := fakeVerifySource{
+		evs: []db.MembraneEvent{
+			{ID: 1, TS: now.Add(-2 * time.Hour), Direction: "request", RequestSHA256: "h"},
+			{ID: 2, TS: now.Add(-time.Hour), Direction: "request", RequestSHA256: "h"},
+		},
+		recs: []db.LLMRawRequest{{ID: 7, Raw: raw, MembraneHash: "h"}, {ID: 8, Raw: raw, MembraneHash: "h"}},
+	}
+	got, err := VerifyTask(e, src, "42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Result != VerifyPass || got.Failed != 0 || got.LearnedLater != 2 || got.Paired != 2 {
+		t.Fatalf("VerifyTask = %+v, want pass with 2 learned later", got)
+	}
+	if !strings.Contains(got.Reason, "learned only after") {
+		t.Fatalf("reason %q does not report the learned-later records", got.Reason)
+	}
+}
+
 // evidenceFixture builds events with originals planted in every free-text
 // field an event can carry.
 func evidenceFixture() EvidenceInput {

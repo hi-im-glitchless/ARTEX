@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -55,6 +56,9 @@ func (f *fakePersistence) InsertMembraneEntry(e *db.MembraneEntry) (db.MembraneE
 		n.Source = "auto"
 	}
 	n.OriginalEnc = append([]byte(nil), e.OriginalEnc...)
+	if n.FirstSeen.IsZero() {
+		n.FirstSeen = time.Now()
+	}
 	f.entries = append(f.entries, n)
 	return n, nil
 }

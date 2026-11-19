@@ -1789,6 +1789,10 @@ export interface MembraneVerifyResult {
   failed: number;
   failed_ids: number[] | null;
   failed_kinds: Record<string, number> | null;
+  /** Records holding only values enrolled after they were sent (disclosed before the membrane knew them; not a miss). */
+  learned_later?: number;
+  learned_later_ids?: number[] | null;
+  learned_later_kinds?: Record<string, number> | null;
   no_raw: number;
   unmembraned: number;
   blocked: number;

@@ -70,7 +70,7 @@ func reqEvent(id int64, ts time.Time, hash string) db.MembraneEvent {
 // request without a paired record makes the result inconclusive.
 func TestVerifyTaskPairsByHash(t *testing.T) {
 	e, _ := newTestEngine(t)
-	t0 := time.Now().Add(-time.Hour)
+	t0 := time.Now().Add(time.Hour) // sent after the fixture values were enrolled: a miss
 	leak := `{"m":"portal.acmebank.pt"}`
 
 	// Empty profile, record carries the hash: scanned and failed.

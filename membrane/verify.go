@@ -2,8 +2,9 @@ package membrane
 
 import (
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -14,6 +15,8 @@ import (
 type VerifyRecord struct {
 	ID  int64
 	Raw string
+	// At is when the request was sent (its audit event); zero when unknown.
+	At time.Time
 }
 
 // Verify outcomes (VerifyResult.Result).
@@ -26,8 +29,10 @@ const (
 // VerifyNote states what a verification does and does not show; the CLI,
 // the API and the evidence repeat it.
 const VerifyNote = "Verification re-scans the recorded wire bytes with the membrane dictionary as of the check. " +
-	"A failure may be a value the membrane learned after the request was sent: still a disclosure to the model provider, " +
-	"but not necessarily a membrane miss at send time. Values purged by a company key destruction are no longer scanned."
+	"A value the membrane already knew when the request was sent is a miss and fails the verification. " +
+	"A value it learned only after the request was sent is listed separately as learned later: " +
+	"a disclosure to the model provider before the membrane knew the value, not a membrane miss. " +
+	"Values purged by a company key destruction are no longer scanned."
 
 // VerifyResult is the outcome of an offline verification (spec §10.2). It
 // carries counts, record ids and kinds only, never values.
@@ -39,8 +44,12 @@ const VerifyNote = "Verification re-scans the recorded wire bytes with the membr
 // pairing existed) and is counted in Unmembraned, not scanned.
 //
 // Checked counts the membraned records with raw bytes that were scanned,
-// Failed those in which LeakCheck found an enrolled original (FailedIDs,
-// ascending; FailedKinds sums the hits per kind), NoRaw membraned records
+// Failed those in which LeakCheck found an original the membrane had
+// already enrolled when the request was sent (FailedIDs, ascending;
+// FailedKinds sums those hits per kind). LearnedLater counts the other
+// records with hits: every original found was enrolled after the request
+// was sent (LearnedLaterIDs, LearnedLaterKinds). A hit whose enrolment time
+// or send time is unknown counts as a miss. NoRaw membraned records
 // without raw bytes. Forwarded counts the task's forwarded request events,
 // Paired those with a scanned record, Unpaired the rest. Result is "fail"
 // when a record failed or the chain is broken, else "inconclusive" when a
@@ -51,19 +60,24 @@ const VerifyNote = "Verification re-scans the recorded wire bytes with the membr
 // membrane error): never forwarded, not scanned. ChainOK and ChainFirstBadID come from the audit
 // chain check, which Verify itself does not run (VerifyTask does).
 type VerifyResult struct {
-	Result          string         `json:"result"`
-	Checked         int            `json:"checked"`
-	Failed          int            `json:"failed"`
-	FailedIDs       []int64        `json:"failed_ids"`
-	FailedKinds     map[string]int `json:"failed_kinds"`
-	NoRaw           int            `json:"no_raw"`
-	Unmembraned     int            `json:"unmembraned"`
-	Blocked         int            `json:"blocked"`
-	Forwarded       int            `json:"forwarded"`
-	Paired          int            `json:"paired"`
-	Unpaired        int            `json:"unpaired"`
-	ChainOK         bool           `json:"chain_ok"`
-	ChainFirstBadID int64          `json:"chain_first_bad_id,omitempty"`
+	Result      string         `json:"result"`
+	Checked     int            `json:"checked"`
+	Failed      int            `json:"failed"`
+	FailedIDs   []int64        `json:"failed_ids"`
+	FailedKinds map[string]int `json:"failed_kinds"`
+	// LearnedLater: records that only hold values enrolled after they were
+	// sent (disclosed before the membrane knew them; not a miss).
+	LearnedLater      int            `json:"learned_later"`
+	LearnedLaterIDs   []int64        `json:"learned_later_ids"`
+	LearnedLaterKinds map[string]int `json:"learned_later_kinds"`
+	NoRaw             int            `json:"no_raw"`
+	Unmembraned       int            `json:"unmembraned"`
+	Blocked           int            `json:"blocked"`
+	Forwarded         int            `json:"forwarded"`
+	Paired            int            `json:"paired"`
+	Unpaired          int            `json:"unpaired"`
+	ChainOK           bool           `json:"chain_ok"`
+	ChainFirstBadID   int64          `json:"chain_first_bad_id,omitempty"`
 	// Reason explains an inconclusive or failed result (counts only).
 	Reason string `json:"reason,omitempty"`
 	Note   string `json:"note"`
@@ -100,11 +114,20 @@ func (r *VerifyResult) finish() {
 			r.Reason = "no request was forwarded through the membrane for this task: nothing to re-scan"
 		}
 	}
+	if r.LearnedLater > 0 {
+		later := fmt.Sprintf("%d recorded request(s) hold values the membrane learned only after they were sent (disclosed before it knew them)", r.LearnedLater)
+		if r.Reason == "" {
+			r.Reason = later
+		} else {
+			r.Reason += "; " + later
+		}
+	}
 	r.Note = VerifyNote
 }
 
 func newVerifyResult() VerifyResult {
-	return VerifyResult{FailedIDs: []int64{}, FailedKinds: map[string]int{}, Note: VerifyNote}
+	return VerifyResult{FailedIDs: []int64{}, FailedKinds: map[string]int{},
+		LearnedLaterIDs: []int64{}, LearnedLaterKinds: map[string]int{}, Note: VerifyNote}
 }
 
 // Verify re-runs the pre-send leak check over the recorded raw requests with
@@ -124,17 +147,35 @@ func (r *VerifyResult) add(e *Engine, records []VerifyRecord) {
 			continue
 		}
 		r.Checked++
-		hits := e.LeakCheck([]byte(rec.Raw))
+		hits, firsts := e.leakScan(rec.Raw)
 		if len(hits) == 0 {
 			continue
 		}
-		r.Failed++
-		r.FailedIDs = append(r.FailedIDs, rec.ID)
-		for _, h := range hits {
-			r.FailedKinds[string(h.Kind)]++
+		missed := map[string]int{}
+		later := map[string]int{}
+		for i, h := range hits {
+			if rec.At.IsZero() || firsts[i].IsZero() || !firsts[i].After(rec.At) {
+				missed[string(h.Kind)]++
+			} else {
+				later[string(h.Kind)]++
+			}
+		}
+		if len(missed) > 0 {
+			r.Failed++
+			r.FailedIDs = append(r.FailedIDs, rec.ID)
+		} else {
+			r.LearnedLater++
+			r.LearnedLaterIDs = append(r.LearnedLaterIDs, rec.ID)
+		}
+		for k, n := range missed {
+			r.FailedKinds[k] += n
+		}
+		for k, n := range later {
+			r.LearnedLaterKinds[k] += n
 		}
 	}
-	sort.Slice(r.FailedIDs, func(i, j int) bool { return r.FailedIDs[i] < r.FailedIDs[j] })
+	slices.Sort(r.FailedIDs)
+	slices.Sort(r.LearnedLaterIDs)
 }
 
 // VerifySource is the part of *db.DB VerifyTask reads.
@@ -162,12 +203,17 @@ func verifyTask(e *Engine, src VerifySource, taskID string, evs []db.MembraneEve
 	res := newVerifyResult()
 	// Forwarded request events by hash (identical requests share a hash:
 	// pairing is by multiplicity).
-	want := map[string]int{}
+	// Each hash's send times, oldest first: a record takes the time of the
+	// event it pairs with.
+	want := map[string][]time.Time{}
 	for _, ev := range evs {
 		if ev.Direction == "request" && !ev.Blocked {
 			res.Forwarded++
-			want[ev.RequestSHA256]++
+			want[ev.RequestSHA256] = append(want[ev.RequestSHA256], ev.TS)
 		}
+	}
+	for _, ts := range want {
+		slices.SortFunc(ts, func(a, b time.Time) int { return a.Compare(b) })
 	}
 	var after int64
 	for {
@@ -189,11 +235,12 @@ func verifyTask(e *Engine, src VerifySource, taskID string, evs []db.MembraneEve
 				}
 				continue
 			}
-			if p.Raw != "" && want[p.MembraneHash] > 0 {
-				want[p.MembraneHash]--
+			var at time.Time
+			if ts := want[p.MembraneHash]; p.Raw != "" && len(ts) > 0 {
+				at, want[p.MembraneHash] = ts[0], ts[1:]
 				res.Paired++
 			}
-			recs = append(recs, VerifyRecord{ID: p.ID, Raw: p.Raw})
+			recs = append(recs, VerifyRecord{ID: p.ID, Raw: p.Raw, At: at})
 		}
 		res.add(e, recs)
 	}

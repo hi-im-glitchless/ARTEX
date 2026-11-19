@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Engine rewrites text between the real universe and the alias universe:
@@ -829,15 +830,28 @@ func sortHits(hits []LeakHit) {
 
 // leakCheckFull is LeakCheck without segments or cache.
 func (e *Engine) leakCheckFull(text string) []LeakHit {
+	hits, _ := e.leakScan(text)
+	return hits
+}
+
+// leakScan is leakCheckFull that also returns, per hit (same order), when
+// the original found was first enrolled; zero when unknown.
+func (e *Engine) leakScan(text string) ([]LeakHit, []time.Time) {
 	e.leakScans.Add(1)
 	dict := e.s.Dictionary()
 	seen := map[LeakHit]bool{}
 	var hits []LeakHit
-	add := func(k Kind, off int) {
+	firsts := map[LeakHit]time.Time{}
+	add := func(k Kind, off int, orig string) {
 		h := LeakHit{Kind: k, Offset: off}
 		if !seen[h] {
 			seen[h] = true
 			hits = append(hits, h)
+			if orig != "" {
+				if t, ok := e.s.FirstSeen(orig); ok {
+					firsts[h] = t
+				}
+			}
 		}
 	}
 	scan := func(t string, toRaw func(int) int) {
@@ -856,11 +870,11 @@ func (e *Engine) leakCheckFull(text string) []LeakHit {
 			if envelopeNumber(t, m.Start, m.End) {
 				continue // a request setting (max_tokens), not content
 			}
-			add(m.Kind, toRaw(m.Start))
+			add(m.Kind, toRaw(m.Start), m.Original)
 		}
 		for _, sp := range ipv6s(t, ipv4s(t, nil)) {
 			if _, k, ok := e.s.AliasFor(sp.Value); ok && (k == KindIPv4 || k == KindIPv6) {
-				add(k, toRaw(sp.Start))
+				add(k, toRaw(sp.Start), sp.Value)
 			}
 		}
 		// Enrolled real values inside the alias ranges (240/4,
@@ -868,7 +882,7 @@ func (e *Engine) leakCheckFull(text string) []LeakHit {
 		// detectors skip those ranges. Minted aliases are not flagged.
 		for _, sh := range scanShapes(t) {
 			if s, _, k, ok := e.enrolledLookalike(t, sh); ok {
-				add(k, toRaw(s))
+				add(k, toRaw(s), "")
 			}
 		}
 	}
@@ -892,7 +906,11 @@ func (e *Engine) leakCheckFull(text string) []LeakHit {
 		tokens(v.text, func(i int) int { return v.rs[i] })
 	}
 	sortHits(hits)
-	return hits
+	at := make([]time.Time, len(hits))
+	for i, h := range hits {
+		at[i] = firsts[h]
+	}
+	return hits, at
 }
 
 // envelopeKeys are request settings, in the canonical (Go field) and wire

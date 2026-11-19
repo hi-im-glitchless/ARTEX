@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -88,6 +89,10 @@ type entry struct {
 	retired    []string // earlier aliases, valid for reverse lookup only
 	companyIDs []int64
 	taskIDs    []int64
+	// firstSeen is when the original was first enrolled (membrane_entries
+	// first_seen); zero when unknown. Verify uses it to tell a value the
+	// membrane knew at send time from one it learned afterwards.
+	firstSeen time.Time
 }
 
 // Store is the in-memory index over the encrypted mapping table. It is safe
@@ -262,7 +267,7 @@ func (s *Store) reload() error {
 			return fmt.Errorf("membrane store: entry %d: index HMAC mismatch: %w (wrong ARTEX_MEMBRANE_HMAC_KEY?)", r.ID, ErrKeyMismatch)
 		}
 		fresh.indexEntry(&entry{id: r.ID, kind: Kind(r.Kind), norm: norm, original: orig, alias: r.Alias,
-			retired: r.RetiredAliases, companyIDs: r.CompanyIDs, taskIDs: r.TaskIDs})
+			retired: r.RetiredAliases, companyIDs: r.CompanyIDs, taskIDs: r.TaskIDs, firstSeen: r.FirstSeen})
 	}
 	for _, b := range brows {
 		blk, err := parseBlock(b)
@@ -639,7 +644,7 @@ func (s *Store) enrollLocked(kind Kind, original string, prov Provenance, mode e
 		}
 		// On conflict the row (and alias) of an earlier enrolment wins.
 		ne := &entry{id: row.ID, kind: kind, norm: norm, original: stored, alias: row.Alias,
-			retired: row.RetiredAliases, companyIDs: row.CompanyIDs, taskIDs: row.TaskIDs}
+			retired: row.RetiredAliases, companyIDs: row.CompanyIDs, taskIDs: row.TaskIDs, firstSeen: row.FirstSeen}
 		s.mu.Lock()
 		s.indexEntry(ne)
 		s.mu.Unlock()
@@ -961,6 +966,17 @@ func (s *Store) AliasFor(original string) (alias string, kind Kind, ok bool) {
 		return e.alias, e.kind, true
 	}
 	return "", "", false
+}
+
+// FirstSeen returns when an enrolled original was first enrolled; ok is
+// false when it is not enrolled or the time is unknown.
+func (s *Store) FirstSeen(original string) (time.Time, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if e := s.entryForLocked(original); e != nil && !e.firstSeen.IsZero() {
+		return e.firstSeen, true
+	}
+	return time.Time{}, false
 }
 
 // entryForLocked finds the entry of an enrolled original, kind-agnostic.

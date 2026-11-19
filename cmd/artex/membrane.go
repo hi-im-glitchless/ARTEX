@@ -102,10 +102,22 @@ func runMembrane(args []string, stdout, stderr io.Writer) int {
 		sort.Strings(kinds)
 		fmt.Fprintf(stdout, "failed_ids=%s kinds=%s\n", strings.Join(ids, ","), strings.Join(kinds, ","))
 	}
+	if res.LearnedLater > 0 {
+		ids := make([]string, len(res.LearnedLaterIDs))
+		for i, x := range res.LearnedLaterIDs {
+			ids[i] = strconv.FormatInt(x, 10)
+		}
+		kinds := make([]string, 0, len(res.LearnedLaterKinds))
+		for k, n := range res.LearnedLaterKinds {
+			kinds = append(kinds, fmt.Sprintf("%s:%d", k, n))
+		}
+		sort.Strings(kinds)
+		fmt.Fprintf(stdout, "learned_later_ids=%s kinds=%s\n", strings.Join(ids, ","), strings.Join(kinds, ","))
+	}
 	if !res.ChainOK {
 		fmt.Fprintf(stdout, "chain_first_bad_id=%d\n", res.ChainFirstBadID)
 	}
-	if res.Result != membrane.VerifyPass {
+	if res.Result != membrane.VerifyPass || res.LearnedLater > 0 {
 		fmt.Fprintln(stdout, "note: "+membrane.VerifyNote)
 	}
 	switch res.Result {

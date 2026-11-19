@@ -48,11 +48,29 @@ const RESULT_STYLE: Record<MembraneVerifyResult["result"], { label: string; cls:
   },
 };
 
-function Stat({ label, value, warn }: { label: string; value: React.ReactNode; warn?: boolean }) {
+function Stat({
+  label,
+  value,
+  warn,
+  caution,
+}: {
+  label: string;
+  value: React.ReactNode;
+  warn?: boolean;
+  caution?: boolean;
+}) {
   return (
     <div className="rounded-md border px-2.5 py-1.5">
       <div className="text-[11px] text-muted-foreground">{label}</div>
-      <div className={cn("font-medium font-mono text-sm", warn && "text-red-600 dark:text-red-400")}>{value}</div>
+      <div
+        className={cn(
+          "font-medium font-mono text-sm",
+          caution && "text-amber-600 dark:text-amber-400",
+          warn && "text-red-600 dark:text-red-400",
+        )}
+      >
+        {value}
+      </div>
     </div>
   );
 }
@@ -61,6 +79,9 @@ function VerifyPanel({ result }: { result: MembraneVerifyResult }) {
   const style = RESULT_STYLE[result.result] ?? RESULT_STYLE.inconclusive;
   const failedKinds = fmtCounts(result.failed_kinds);
   const failedIDs = result.failed_ids ?? [];
+  const laterCount = result.learned_later ?? 0;
+  const laterKinds = fmtCounts(result.learned_later_kinds ?? null);
+  const laterIDs = result.learned_later_ids ?? [];
   return (
     <div className="grid gap-3">
       <div className="flex flex-wrap items-center gap-2">
@@ -71,7 +92,8 @@ function VerifyPanel({ result }: { result: MembraneVerifyResult }) {
       </div>
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6">
         <Stat label="Records re-scanned" value={result.checked} />
-        <Stat label="Failed" value={result.failed} warn={result.failed > 0} />
+        <Stat label="Missed (known at send)" value={result.failed} warn={result.failed > 0} />
+        <Stat label="Learned later" value={laterCount} caution={laterCount > 0} />
         <Stat label="Forwarded requests" value={result.forwarded} />
         <Stat label="Paired / unpaired" value={`${result.paired} / ${result.unpaired}`} />
         <Stat label="Blocked records" value={result.blocked} />
@@ -87,14 +109,37 @@ function VerifyPanel({ result }: { result: MembraneVerifyResult }) {
         <div className="text-sm">
           {failedKinds && (
             <div>
-              <span className="text-muted-foreground">Failed kinds: </span>
+              <span className="text-muted-foreground">Missed kinds: </span>
               <span className="font-mono">{failedKinds}</span>
             </div>
           )}
           {failedIDs.length > 0 && (
             <div>
-              <span className="text-muted-foreground">Failed LLM record ids: </span>
+              <span className="text-muted-foreground">Missed LLM record ids: </span>
               <span className="font-mono">{failedIDs.join(", ")}</span>
+            </div>
+          )}
+        </div>
+      )}
+      {laterCount > 0 && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-sm">
+          <div className="font-medium text-amber-700 dark:text-amber-300">
+            Disclosed before the membrane learned the value
+          </div>
+          <div className="text-muted-foreground text-xs">
+            These requests carried values the membrane enrolled only after they were sent. The model provider received
+            them in clear; the membrane did not know them yet, so they are not misses.
+          </div>
+          {laterKinds && (
+            <div>
+              <span className="text-muted-foreground">Kinds: </span>
+              <span className="font-mono">{laterKinds}</span>
+            </div>
+          )}
+          {laterIDs.length > 0 && (
+            <div>
+              <span className="text-muted-foreground">LLM record ids: </span>
+              <span className="font-mono">{laterIDs.join(", ")}</span>
             </div>
           )}
         </div>

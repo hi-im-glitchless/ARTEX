@@ -288,6 +288,12 @@ func BuildEvidence(in EvidenceInput) (markdown string, jsonDoc []byte) {
 	if v.FailedKinds == nil {
 		v.FailedKinds = map[string]int{}
 	}
+	if v.LearnedLaterIDs == nil {
+		v.LearnedLaterIDs = []int64{}
+	}
+	if v.LearnedLaterKinds == nil {
+		v.LearnedLaterKinds = map[string]int{}
+	}
 	if v.Note == "" {
 		v.Note = VerifyNote
 	}
@@ -304,7 +310,7 @@ func BuildEvidence(in EvidenceInput) (markdown string, jsonDoc []byte) {
 		if v.Forwarded == 0 {
 			d.Proof.Statement = "No request was forwarded to a remote model through the membrane for this task, so there was nothing to re-scan; the audit chain is intact. This shows no membrane traffic, not that membraned traffic was verified."
 		} else {
-			d.Proof.Statement = "Offline verification passed: every forwarded request's recorded wire body was re-scanned and no enrolled original was found, and the audit chain is intact."
+			d.Proof.Statement = "Offline verification passed: every forwarded request's recorded wire body was re-scanned and no value the membrane knew at send time was found, and the audit chain is intact."
 		}
 	case VerifyFail:
 		d.Proof.Statement = "Offline verification FAILED: see the failed record ids and kinds, and the chain status."
@@ -413,8 +419,8 @@ func renderEvidenceMD(d *EvidenceDoc) string {
 		d.Proof.Level, strings.ToUpper(orDash(v.Result)), d.Proof.RequestHash)
 	w("- Forwarded requests: %d (with a request hash: %d); paired with a recorded wire body: %d; unpaired: %d\n",
 		v.Forwarded, d.Proof.RequestsHashed, v.Paired, v.Unpaired)
-	w("- Recorded wire bodies re-scanned: checked=%d failed=%d (membraned records without a body: %d, unmembraned records: %d, refused by the membrane and never forwarded: %d)\n",
-		v.Checked, v.Failed, v.NoRaw, v.Unmembraned, v.Blocked)
+	w("- Recorded wire bodies re-scanned: checked=%d failed=%d learned_later=%d (membraned records without a body: %d, unmembraned records: %d, refused by the membrane and never forwarded: %d)\n",
+		v.Checked, v.Failed, v.LearnedLater, v.NoRaw, v.Unmembraned, v.Blocked)
 	if v.Failed > 0 {
 		ids := make([]string, len(v.FailedIDs))
 		for i, id := range v.FailedIDs {
@@ -422,6 +428,17 @@ func renderEvidenceMD(d *EvidenceDoc) string {
 		}
 		w("- Failed llm_records ids: %s\n\n", strings.Join(ids, ", "))
 		table(&b, "Kind found", v.FailedKinds)
+	}
+	if v.LearnedLater > 0 {
+		ids := make([]string, len(v.LearnedLaterIDs))
+		for i, id := range v.LearnedLaterIDs {
+			ids[i] = fmt.Sprint(id)
+		}
+		w("\n### Disclosed before the membrane learned the value\n\n")
+		w("%d recorded request(s) carried values the membrane enrolled only after those requests were sent. "+
+			"The model provider received these values in clear; the membrane did not know them yet, so this is not a miss.\n\n", v.LearnedLater)
+		w("- llm_records ids: %s\n\n", strings.Join(ids, ", "))
+		table(&b, "Kind found", v.LearnedLaterKinds)
 	}
 	w("\n%s\n\n%s\n\n%s\n", d.Proof.Statement, v.Note, d.Proof.LevelExplanation)
 
